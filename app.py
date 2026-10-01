@@ -25,70 +25,90 @@ st.set_page_config(
 # ШРИФТ
 # ============================================================
 
-def register_font():
-    """
-    Пытаемся найти Roboto.
-    Если не найден — ReportLab будет использовать Helvetica.
-    """
+def register_fonts():
 
-    font_paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    paths = [
+        (
+            "DejaVuSans",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        ),
+        (
+            "DejaVuSansBold",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        ),
     ]
 
-    regular = None
-    bold = None
+    regular = "Helvetica"
+    bold = "Helvetica-Bold"
 
-    for path in font_paths:
-        if "Bold" not in path and regular is None:
-            try:
-                pdfmetrics.registerFont(TTFont("AppFont", path))
-                regular = "AppFont"
-            except Exception:
-                pass
+    for name, path in paths:
 
-        if "Bold" in path and bold is None:
-            try:
-                pdfmetrics.registerFont(TTFont("AppFontBold", path))
-                bold = "AppFontBold"
-            except Exception:
-                pass
+        try:
+            pdfmetrics.registerFont(
+                TTFont(name, path)
+            )
 
-    return regular or "Helvetica", bold or "Helvetica-Bold"
+            if name == "DejaVuSans":
+                regular = name
+
+            if name == "DejaVuSansBold":
+                bold = name
+
+        except Exception:
+            pass
+
+    return regular, bold
 
 
-FONT_REGULAR, FONT_BOLD = register_font()
+FONT_REGULAR, FONT_BOLD = register_fonts()
 
 
 # ============================================================
-# НОРМАЛИЗАЦИЯ НОМЕРА ОТПРАВЛЕНИЯ
+# НОРМАЛИЗАЦИЯ
 # ============================================================
 
-def normalize_shipment(value):
-    """
-    Нормализация номера отправления.
-    """
+def normalize_text(value):
 
     if value is None:
         return ""
 
-    value = str(value).strip().lower()
+    value = str(value)
 
-    value = value.replace(" ", "")
-    value = value.replace("\n", "")
-    value = value.replace("\r", "")
-    value = value.replace("—", "-")
-    value = value.replace("–", "-")
+    value = (
+        value
+        .replace("\n", " ")
+        .replace("\r", " ")
+        .replace("\t", " ")
+        .replace("—", "-")
+        .replace("–", "-")
+        .replace("−", "-")
+    )
+
+    value = re.sub(
+        r"\s+",
+        " ",
+        value
+    )
+
+    return value.strip()
+
+
+def normalize_shipment(value):
+
+    value = normalize_text(value)
+
+    value = value.lower()
+
+    value = re.sub(
+        r"\s+",
+        "",
+        value
+    )
 
     return value
 
 
 def compact_shipment(value):
-    """
-    Максимально компактная форма номера.
-    """
 
     value = normalize_shipment(value)
 
@@ -100,13 +120,83 @@ def compact_shipment(value):
 
 
 # ============================================================
-# ПОИСК НОМЕРА ОТПРАВЛЕНИЯ НА ЭТИКЕТКЕ
+# ПОИСК НОМЕРА НА ЭТИКЕТКЕ
 # ============================================================
 
+def find_possible_numbers(text):
+
+    """
+    Ищем максимально широкий набор вариантов.
+
+    Важно:
+    сначала ищем полноценный номер Ozon,
+    потом более общие комбинации.
+    """
+
+    if not text:
+        return []
+
+    text = normalize_text(text)
+
+    candidates = []
+
+    patterns = [
+
+        # ----------------------------------------------------
+        # Классический Ozon:
+        # 12345678-0000-1
+        # ----------------------------------------------------
+
+        r"\b\d{8,15}-\d{3,8}-\d{1,8}\b",
+
+        # 123456789-0000-1
+        r"\b\d{7,16}-\d{3,8}-\d{1,8}\b",
+
+        # ----------------------------------------------------
+        # Варианты с пробелами вокруг дефиса
+        # ----------------------------------------------------
+
+        r"\b\d{7,16}\s*-\s*\d{3,8}\s*-\s*\d{1,8}\b",
+
+        # ----------------------------------------------------
+        # Любая длинная цепочка из цифр и дефисов
+        # ----------------------------------------------------
+
+        r"\b\d{7,16}(?:\s*-\s*\d{1,10}){1,4}\b",
+
+        # ----------------------------------------------------
+        # Если PDF разделил номер пробелами
+        # ----------------------------------------------------
+
+        r"\b\d{7,16}\s+\d{3,10}\s+\d{1,10}\b",
+    ]
+
+    for pattern in patterns:
+
+        matches = re.findall(
+            pattern,
+            text
+        )
+
+        for match in matches:
+
+            candidate = normalize_shipment(
+                match
+            )
+
+            candidate = re.sub(
+                r"\s*-\s*",
+                "-",
+                candidate
+            )
+
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    return candidates
+
+
 def extract_shipment_from_label(page):
-    """
-    Извлекает номер отправления непосредственно из PDF этикетки.
-    """
 
     try:
         text = page.extract_text() or ""
@@ -114,61 +204,140 @@ def extract_shipment_from_label(page):
         text = ""
 
     if not text:
-        return None
+        return None, "", []
 
-    # Основной формат Ozon:
-    # 12345678-0000-1
-    patterns = [
-        r"\b\d{8,15}-\d{3,6}-\d+\b",
-        r"\b\d{8,15}-\d{4}-\d+\b",
-        r"\b\d{8,15}-\d{4}\b",
-    ]
 
-    for pattern in patterns:
-        matches = re.findall(pattern, text)
+    # ========================================================
+    # ВАРИАНТ 1 — ПОЛНОЦЕННЫЕ НОМЕРА
+    # ========================================================
 
-        if matches:
-            # Берём самый длинный / наиболее похожий
-            matches = sorted(
-                matches,
-                key=len,
-                reverse=True
-            )
+    candidates = find_possible_numbers(
+        text
+    )
 
-            return normalize_shipment(matches[0])
+    if candidates:
 
-    # Дополнительный вариант:
-    # если номер находится рядом со словами отправление / заказ
+        # Предпочитаем самый длинный
+        candidates_sorted = sorted(
+            candidates,
+            key=lambda x: (
+                x.count("-"),
+                len(x)
+            ),
+            reverse=True
+        )
+
+        return (
+            candidates_sorted[0],
+            text,
+            candidates_sorted
+        )
+
+
+    # ========================================================
+    # ВАРИАНТ 2 — ИЩЕМ РЯДОМ СО СЛОВАМИ
+    # ========================================================
+
     lines = [
         x.strip()
         for x in text.splitlines()
         if x.strip()
     ]
 
-    for line in lines:
+    keywords = [
+        "отправление",
+        "отправлен",
+        "номер",
+        "заказ",
+        "order",
+        "posting",
+        "shipment",
+        "ozon"
+    ]
 
-        if (
-            "отправлен" in line.lower()
-            or "posting" in line.lower()
-            or "заказ" in line.lower()
+    for i, line in enumerate(lines):
+
+        low = line.lower()
+
+        if any(
+            keyword in low
+            for keyword in keywords
         ):
 
-            matches = re.findall(
-                r"\d{8,15}(?:-\d+)+",
+            # Сама строка
+            local_candidates = find_possible_numbers(
                 line
             )
 
-            if matches:
-                return normalize_shipment(matches[0])
+            if local_candidates:
 
-    return None
+                return (
+                    local_candidates[0],
+                    text,
+                    local_candidates
+                )
+
+            # Следующая строка
+            if i + 1 < len(lines):
+
+                local_candidates = find_possible_numbers(
+                    lines[i + 1]
+                )
+
+                if local_candidates:
+
+                    return (
+                        local_candidates[0],
+                        text,
+                        local_candidates
+                    )
+
+
+    # ========================================================
+    # ВАРИАНТ 3 — ДЛИННЫЕ ЧИСЛА
+    # ========================================================
+
+    long_numbers = re.findall(
+        r"\b\d{10,18}\b",
+        text
+    )
+
+    if long_numbers:
+
+        # Убираем очевидные служебные номера
+        filtered = []
+
+        for number in long_numbers:
+
+            if len(number) < 10:
+                continue
+
+            filtered.append(
+                number
+            )
+
+        if filtered:
+
+            # Сохраняем кандидатов,
+            # но НЕ считаем это надёжным
+            return (
+                filtered[0],
+                text,
+                filtered
+            )
+
+
+    return None, text, []
 
 
 # ============================================================
-# API Ozon
+# API OZON
 # ============================================================
 
-API_URL = "https://api-seller.ozon.ru/v1/assembly/fbs/posting/list"
+API_URL = (
+    "https://api-seller.ozon.ru/"
+    "v1/assembly/fbs/posting/list"
+)
 
 
 def api_request(
@@ -178,9 +347,6 @@ def api_request(
     date_to,
     limit=1000
 ):
-    """
-    Один запрос API с пагинацией.
-    """
 
     headers = {
         "Client-Id": str(client_id).strip(),
@@ -188,15 +354,11 @@ def api_request(
         "Content-Type": "application/json"
     }
 
-    all_postings = []
+    postings_all = []
 
     cursor = ""
 
-    page_number = 0
-
     while True:
-
-        page_number += 1
 
         payload = {
             "filter": {
@@ -210,74 +372,62 @@ def api_request(
         if cursor:
             payload["cursor"] = cursor
 
-        try:
-
-            response = requests.post(
-                API_URL,
-                headers=headers,
-                json=payload,
-                timeout=60
-            )
-
-        except Exception as e:
-            raise RuntimeError(
-                f"Ошибка соединения с Ozon API: {e}"
-            )
+        response = requests.post(
+            API_URL,
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
 
         if response.status_code != 200:
 
             try:
-                error_text = response.json()
+                error = response.json()
             except Exception:
-                error_text = response.text
+                error = response.text
 
             raise RuntimeError(
-                f"Ozon API HTTP {response.status_code}: "
-                f"{error_text}"
+                f"Ozon API HTTP "
+                f"{response.status_code}: {error}"
             )
 
-        try:
-            data = response.json()
-        except Exception:
-            raise RuntimeError(
-                "Ozon API вернул некорректный JSON."
-            )
+        data = response.json()
 
-        postings = data.get("postings", [])
+        postings = data.get(
+            "postings",
+            []
+        )
 
         if not postings:
             break
 
-        all_postings.extend(postings)
+        postings_all.extend(
+            postings
+        )
 
-        next_cursor = data.get("cursor")
+        next_cursor = data.get(
+            "cursor"
+        )
 
-        # Если курсора нет — данных больше нет
         if not next_cursor:
             break
 
-        # Защита от зацикливания
         if next_cursor == cursor:
             break
 
         cursor = next_cursor
 
-        # Если вернулось меньше limit,
-        # обычно следующей страницы уже нет.
         if len(postings) < limit:
             break
 
-    return all_postings
+    return postings_all
 
 
 # ============================================================
-# ПРЕОБРАЗОВАНИЕ POSTING В НАШУ СТРУКТУРУ
+# POSTING → RECORD
 # ============================================================
 
 def posting_to_record(posting):
-    """
-    Превращает ответ API Ozon в удобную структуру.
-    """
 
     posting_number = (
         posting.get("posting_number")
@@ -298,7 +448,10 @@ def posting_to_record(posting):
 
     for product in products:
 
-        if not isinstance(product, dict):
+        if not isinstance(
+            product,
+            dict
+        ):
             continue
 
         name = (
@@ -322,71 +475,96 @@ def posting_to_record(posting):
         )
 
         if name:
-            names.append(str(name))
+            names.append(
+                str(name)
+            )
 
         if article:
-            articles.append(str(article))
+            articles.append(
+                str(article)
+            )
 
         try:
-            quantities.append(float(quantity))
+            quantities.append(
+                float(quantity)
+            )
         except Exception:
             pass
 
-    total_qty = sum(quantities)
+    total_qty = sum(
+        quantities
+    )
 
     if total_qty.is_integer():
         total_qty = int(total_qty)
 
     return {
-        "shipment": str(posting_number),
-        "article": " + ".join(articles) if articles else "-",
-        "name": " + ".join(names) if names else "-",
-        "qty": str(total_qty),
+        "shipment": str(
+            posting_number
+        ),
+        "article": (
+            " + ".join(articles)
+            if articles
+            else "-"
+        ),
+        "name": (
+            " + ".join(names)
+            if names
+            else "-"
+        ),
+        "qty": str(
+            total_qty
+        ),
         "raw": posting
     }
 
 
 # ============================================================
-# ДОБАВЛЕНИЕ API ДАННЫХ В MAP
+# ДОБАВЛЕНИЕ В MAP
 # ============================================================
 
-def add_postings_to_mapping(postings, api_mapping):
-    """
-    Добавляет postings в общий словарь.
-    """
-
-    added = 0
+def add_postings_to_mapping(
+    postings,
+    api_mapping
+):
 
     for posting in postings:
 
-        record = posting_to_record(posting)
+        record = posting_to_record(
+            posting
+        )
 
-        shipment = record["shipment"]
+        shipment = record[
+            "shipment"
+        ]
 
         if not shipment:
             continue
 
-        normalized = normalize_shipment(shipment)
+        normalized = normalize_shipment(
+            shipment
+        )
 
         if not normalized:
             continue
 
-        # Основной ключ
-        api_mapping[normalized] = record
+        api_mapping[
+            normalized
+        ] = record
 
-        # Компактный ключ
-        compact = compact_shipment(normalized)
+        compact = compact_shipment(
+            normalized
+        )
 
         if compact:
-            api_mapping[f"__compact__{compact}"] = record
 
-        added += 1
-
-    return added
+            api_mapping[
+                f"__compact__{compact}"
+            ] = record
 
 
 # ============================================================
-# ПОЛУЧЕНИЕ API ДАННЫХ КУСКАМИ
+# API КУСКАМИ
 # ============================================================
 
 def get_assembly_data_chunked(
@@ -396,53 +574,57 @@ def get_assembly_data_chunked(
     days_forward=7,
     chunk_days=30
 ):
-    """
-    Получаем API кусками.
-
-    Например:
-
-    180 дней назад
-    ↓
-    150
-    ↓
-    120
-    ↓
-    ...
-    ↓
-    сегодня
-    ↓
-    +7 дней
-
-    Это позволяет не зависеть от одного огромного периода.
-    """
 
     api_mapping = {}
 
-    today = datetime.now()
+    now = datetime.utcnow()
 
-    start_date = today - timedelta(days=days_back)
-    end_date = today + timedelta(days=days_forward)
+    start = (
+        now -
+        timedelta(
+            days=days_back
+        )
+    )
 
-    total_requests = 0
-    total_postings = 0
+    finish = (
+        now +
+        timedelta(
+            days=days_forward
+        )
+    )
 
-    current = start_date
+    current = start
+
+    chunks = max(
+        1,
+        int(
+            (
+                finish - start
+            ).total_seconds()
+            /
+            (
+                chunk_days *
+                86400
+            )
+        ) + 1
+    )
 
     progress = st.progress(
         0,
-        text="Получение данных Ozon API..."
+        text="Получение данных API..."
     )
 
-    total_seconds = max(
-        (end_date - start_date).total_seconds(),
-        1
-    )
+    request_number = 0
+    total_postings = 0
 
-    while current < end_date:
+    while current < finish:
 
         chunk_end = min(
-            current + timedelta(days=chunk_days),
-            end_date
+            current +
+            timedelta(
+                days=chunk_days
+            ),
+            finish
         )
 
         date_from = current.strftime(
@@ -453,35 +635,32 @@ def get_assembly_data_chunked(
             "%Y-%m-%dT%H:%M:%SZ"
         )
 
-        total_requests += 1
+        request_number += 1
 
         postings = api_request(
-            client_id=client_id,
-            api_key=api_key,
-            date_from=date_from,
-            date_to=date_to
+            client_id,
+            api_key,
+            date_from,
+            date_to
         )
 
-        total_postings += len(postings)
+        total_postings += len(
+            postings
+        )
 
         add_postings_to_mapping(
             postings,
             api_mapping
         )
 
-        elapsed = (
-            chunk_end - start_date
-        ).total_seconds()
-
-        percent = min(
-            elapsed / total_seconds,
-            1
-        )
-
         progress.progress(
-            percent,
+            min(
+                request_number / chunks,
+                1
+            ),
             text=(
-                f"API: {date_from[:10]} → "
+                f"Запрос {request_number}: "
+                f"{date_from[:10]} → "
                 f"{date_to[:10]} | "
                 f"получено {len(postings)}"
             )
@@ -491,49 +670,64 @@ def get_assembly_data_chunked(
 
     progress.progress(
         1,
-        text=(
-            f"API завершено. "
-            f"Уникальных отправлений: "
-            f"{len([k for k in api_mapping if not k.startswith('__compact__')])}"
-        )
+        text="API завершено"
     )
 
-    return api_mapping, total_requests, total_postings
+    return (
+        api_mapping,
+        total_postings,
+        request_number
+    )
 
 
 # ============================================================
-# ПОИСК В API
+# ПОИСК API
 # ============================================================
 
-def find_api_posting(shipment, api_mapping):
+def find_api_posting(
+    shipment,
+    api_mapping
+):
 
     if not shipment:
         return None
 
-    normalized = normalize_shipment(shipment)
+    normalized = normalize_shipment(
+        shipment
+    )
 
-    # 1. Точное совпадение
     if normalized in api_mapping:
-        return api_mapping[normalized]
+        return api_mapping[
+            normalized
+        ]
 
-    # 2. Компактное совпадение
-    compact = compact_shipment(normalized)
+    compact = compact_shipment(
+        normalized
+    )
 
     if compact:
 
-        compact_key = f"__compact__{compact}"
+        key = (
+            "__compact__"
+            + compact
+        )
 
-        if compact_key in api_mapping:
-            return api_mapping[compact_key]
+        if key in api_mapping:
+            return api_mapping[
+                key
+            ]
 
     return None
 
 
 # ============================================================
-# ПЕРЕНОС ТЕКСТА
+# TEXT WRAP
 # ============================================================
 
-def split_text(text, chars=45):
+def split_text(
+    text,
+    chars=45
+):
 
     if not text:
         return ["-"]
@@ -557,16 +751,20 @@ def split_text(text, chars=45):
             text[:pos]
         )
 
-        text = text[pos:].strip()
+        text = text[
+            pos:
+        ].strip()
 
     if text:
-        result.append(text)
+        result.append(
+            text
+        )
 
     return result
 
 
 # ============================================================
-# ИНФОРМАЦИОННАЯ СТРАНИЦА
+# INFO PDF
 # ============================================================
 
 def create_info_label(
@@ -574,28 +772,29 @@ def create_info_label(
     height,
     order_number,
     product_info,
-    match_status="OK"
+    status="OK"
 ):
-    """
-    Создаёт страницу с информацией после этикетки.
-    """
 
     buffer = io.BytesIO()
 
     c = canvas.Canvas(
         buffer,
-        pagesize=(width, height)
+        pagesize=(
+            width,
+            height
+        )
     )
 
-    # Заголовок
-    if match_status == "OK":
-        title = "ИНФОРМАЦИЯ ОТПРАВЛЕНИЯ"
-    else:
-        title = "ОТПРАВЛЕНИЕ НЕ НАЙДЕНО В API"
+    title = (
+        "ИНФОРМАЦИЯ ОТПРАВЛЕНИЯ"
+        if status == "OK"
+        else
+        "ОТПРАВЛЕНИЕ НЕ НАЙДЕНО"
+    )
 
     c.setFont(
         FONT_BOLD,
-        min(18, width / 22)
+        16
     )
 
     c.drawCentredString(
@@ -606,10 +805,9 @@ def create_info_label(
 
     y = height - 85
 
-    # Отправление
     c.setFont(
         FONT_BOLD,
-        11
+        10
     )
 
     c.drawString(
@@ -620,21 +818,22 @@ def create_info_label(
 
     c.setFont(
         FONT_REGULAR,
-        11
+        10
     )
 
     c.drawString(
-        130,
+        125,
         y,
-        str(order_number or "—")
+        str(
+            order_number or "—"
+        )
     )
 
     y -= 30
 
-    # Статус
     c.setFont(
         FONT_BOLD,
-        11
+        10
     )
 
     c.drawString(
@@ -645,26 +844,26 @@ def create_info_label(
 
     c.setFont(
         FONT_REGULAR,
-        11
+        10
     )
-
-    if match_status == "OK":
-        status_text = "Найдено в Ozon API"
-    else:
-        status_text = "Не найдено в Ozon API"
 
     c.drawString(
-        130,
+        125,
         y,
-        status_text
+        (
+            "Найдено в Ozon API"
+            if status == "OK"
+            else
+            "Не найдено в Ozon API"
+        )
     )
 
-    y -= 40
+    y -= 35
 
     # Артикул
     c.setFont(
         FONT_BOLD,
-        11
+        10
     )
 
     c.drawString(
@@ -673,30 +872,35 @@ def create_info_label(
         "Артикул:"
     )
 
-    y -= 18
+    y -= 16
 
     c.setFont(
         FONT_REGULAR,
-        10
+        9
     )
 
     for line in split_text(
-        product_info.get("article", "-"),
+        product_info.get(
+            "article",
+            "-"
+        ),
         55
     ):
+
         c.drawString(
             30,
             y,
             line
         )
-        y -= 15
 
-    y -= 10
+        y -= 14
+
+    y -= 8
 
     # Товар
     c.setFont(
         FONT_BOLD,
-        11
+        10
     )
 
     c.drawString(
@@ -705,30 +909,34 @@ def create_info_label(
         "Товар:"
     )
 
-    y -= 18
+    y -= 16
 
     c.setFont(
         FONT_REGULAR,
-        10
+        9
     )
 
     for line in split_text(
-        product_info.get("name", "-"),
+        product_info.get(
+            "name",
+            "-"
+        ),
         55
     ):
+
         c.drawString(
             30,
             y,
             line
         )
-        y -= 15
 
-    y -= 10
+        y -= 14
 
-    # Количество
+    y -= 8
+
     c.setFont(
         FONT_BOLD,
-        11
+        10
     )
 
     c.drawString(
@@ -739,39 +947,19 @@ def create_info_label(
 
     c.setFont(
         FONT_REGULAR,
-        11
+        10
     )
 
     c.drawString(
-        130,
+        125,
         y,
-        str(product_info.get("qty", "-"))
-    )
-
-    if match_status != "OK":
-
-        y -= 45
-
-        c.setFont(
-            FONT_BOLD,
-            10
-        )
-
-        warning = [
-            "Этикетка сохранена в итоговом PDF.",
-            "Данные товара не получены из API.",
-            "Проверьте номер отправления."
-        ]
-
-        for line in warning:
-
-            c.drawString(
-                30,
-                y,
-                line
+        str(
+            product_info.get(
+                "qty",
+                "-"
             )
-
-            y -= 15
+        )
+    )
 
     c.showPage()
     c.save()
@@ -782,7 +970,7 @@ def create_info_label(
 
 
 # ============================================================
-# СОЗДАНИЕ ИТОГОВОГО PDF
+# СОЗДАНИЕ PDF
 # ============================================================
 
 def create_final_pdf(
@@ -797,20 +985,24 @@ def create_final_pdf(
 
     writer = PdfWriter()
 
+    diagnostics = []
+
     found = 0
     not_found = 0
 
-    diagnostics = []
-
     for record in label_records:
 
-        page_number = record["page"]
+        page_number = record[
+            "page"
+        ]
 
         page = reader.pages[
             page_number - 1
         ]
 
-        shipment = record["shipment"]
+        shipment = record[
+            "shipment"
+        ]
 
         api_record = find_api_posting(
             shipment,
@@ -821,13 +1013,15 @@ def create_final_pdf(
 
             found += 1
 
-            info = api_record
-
             status = "OK"
+
+            info = api_record
 
         else:
 
             not_found += 1
+
+            status = "НЕ НАЙДЕНО"
 
             info = {
                 "article": "-",
@@ -835,12 +1029,10 @@ def create_final_pdf(
                 "qty": "-"
             }
 
-            status = "НЕ НАЙДЕНО"
+        writer.add_page(
+            page
+        )
 
-        # Сначала оригинальная этикетка
-        writer.add_page(page)
-
-        # Потом наша информационная страница
         width = float(
             page.mediabox.width
         )
@@ -867,19 +1059,37 @@ def create_final_pdf(
 
         diagnostics.append({
             "Страница": page_number,
-            "Отправление": shipment or "—",
+            "Отправление": (
+                shipment
+                or "НЕ РАСПОЗНАНО"
+            ),
+            "Кандидаты": " | ".join(
+                record.get(
+                    "candidates",
+                    []
+                )
+            ),
             "Артикул": (
-                info.get("article", "-")
+                info.get(
+                    "article",
+                    "-"
+                )
                 if api_record
                 else "-"
             ),
             "Товар": (
-                info.get("name", "-")
+                info.get(
+                    "name",
+                    "-"
+                )
                 if api_record
                 else "-"
             ),
             "Кол-во": (
-                info.get("qty", "-")
+                info.get(
+                    "qty",
+                    "-"
+                )
                 if api_record
                 else "-"
             ),
@@ -888,7 +1098,9 @@ def create_final_pdf(
 
     output = io.BytesIO()
 
-    writer.write(output)
+    writer.write(
+        output
+    )
 
     output.seek(0)
 
@@ -909,10 +1121,8 @@ st.title(
 )
 
 st.write(
-    "Загрузите PDF с этикетками Ozon. "
-    "Приложение само найдёт номера отправлений, "
-    "получит данные через API и добавит "
-    "информационную страницу после каждой этикетки."
+    "Распознавание номера отправления "
+    "из PDF + поиск отправления через Ozon API."
 )
 
 
@@ -938,10 +1148,6 @@ st.sidebar.markdown(
     "---"
 )
 
-st.sidebar.subheader(
-    "📅 Период поиска"
-)
-
 days_back = st.sidebar.number_input(
     "Дней назад",
     min_value=30,
@@ -958,31 +1164,19 @@ days_forward = st.sidebar.number_input(
     step=7
 )
 
-st.sidebar.info(
-    "API будет запрашиваться кусками "
-    "по 30 дней. Это позволяет найти "
-    "отправления, которые не попали "
-    "в один большой запрос."
-)
-
 
 # ============================================================
-# ЗАГРУЗКА PDF
+# PDF
 # ============================================================
 
 uploaded_file = st.file_uploader(
-    "📄 PDF с этикетками",
+    "📄 Загрузите PDF этикеток",
     type=["pdf"]
 )
 
 
-# ============================================================
-# ОСНОВНАЯ ЛОГИКА
-# ============================================================
-
 if uploaded_file:
 
-    # Читаем PDF
     try:
 
         reader = PdfReader(
@@ -992,7 +1186,7 @@ if uploaded_file:
     except Exception as e:
 
         st.error(
-            f"Не удалось открыть PDF: {e}"
+            f"Ошибка открытия PDF: {e}"
         )
 
         st.stop()
@@ -1002,12 +1196,13 @@ if uploaded_file:
     )
 
     st.info(
-        f"📄 Страниц в PDF: **{total_pages}**"
+        f"Страниц в PDF: **{total_pages}**"
     )
 
-    # --------------------------------------------------------
-    # 1. РАСПОЗНАЁМ ВСЕ ЭТИКЕТКИ
-    # --------------------------------------------------------
+
+    # ========================================================
+    # РАСПОЗНАВАНИЕ
+    # ========================================================
 
     st.subheader(
         "1️⃣ Распознавание этикеток"
@@ -1015,29 +1210,33 @@ if uploaded_file:
 
     label_records = []
 
-    progress_labels = st.progress(
-        0,
-        text="Читаем номера отправлений..."
+    progress = st.progress(
+        0
     )
 
-    for i, page in enumerate(
+    for page_number, page in enumerate(
         reader.pages,
         start=1
     ):
 
-        shipment = extract_shipment_from_label(
-            page
+        shipment, raw_text, candidates = (
+            extract_shipment_from_label(
+                page
+            )
         )
 
         label_records.append({
-            "page": i,
-            "shipment": shipment
+            "page": page_number,
+            "shipment": shipment,
+            "raw_text": raw_text,
+            "candidates": candidates
         })
 
-        progress_labels.progress(
-            i / total_pages,
+        progress.progress(
+            page_number / total_pages,
             text=(
-                f"Этикетка {i} из "
+                f"Этикетка "
+                f"{page_number} из "
                 f"{total_pages}"
             )
         )
@@ -1052,50 +1251,124 @@ if uploaded_file:
         total_pages - recognized
     )
 
-    col1, col2, col3 = st.columns(3)
+    c1, c2, c3 = st.columns(3)
 
-    col1.metric(
+    c1.metric(
         "Этикеток",
         total_pages
     )
 
-    col2.metric(
+    c2.metric(
         "Номер распознан",
         recognized
     )
 
-    col3.metric(
+    c3.metric(
         "Не распознан",
         not_recognized
     )
 
-    # --------------------------------------------------------
-    # ЕСЛИ API НЕ УКАЗАН
-    # --------------------------------------------------------
+
+    # ========================================================
+    # ДИАГНОСТИКА PDF
+    # ========================================================
+
+    if not_recognized > 0:
+
+        st.error(
+            f"❌ Не удалось определить "
+            f"номер на {not_recognized} "
+            f"этикетках."
+        )
+
+        with st.expander(
+            "🔍 Показать текст первых 5 нераспознанных этикеток"
+        ):
+
+            shown = 0
+
+            for record in label_records:
+
+                if record["shipment"]:
+                    continue
+
+                st.markdown(
+                    f"### Страница {record['page']}"
+                )
+
+                text_preview = record[
+                    "raw_text"
+                ]
+
+                if not text_preview:
+                    text_preview = (
+                        "[PDF не содержит извлекаемого текста]"
+                    )
+
+                st.code(
+                    text_preview[:5000]
+                )
+
+                shown += 1
+
+                if shown >= 5:
+                    break
+
+
+        with st.expander(
+            "🔍 Показать найденные кандидаты"
+        ):
+
+            candidate_rows = []
+
+            for record in label_records:
+
+                candidate_rows.append({
+                    "Страница": record[
+                        "page"
+                    ],
+                    "Номер": record[
+                        "shipment"
+                    ] or "—",
+                    "Кандидаты": " | ".join(
+                        record[
+                            "candidates"
+                        ]
+                    ) or "—"
+                })
+
+            st.dataframe(
+                candidate_rows,
+                use_container_width=True,
+                hide_index=True
+            )
+
+
+    # ========================================================
+    # API
+    # ========================================================
 
     if not client_id or not api_key:
 
         st.warning(
-            "Введите Client-Id и Api-Key в боковой панели."
+            "Введите Client-Id и Api-Key."
         )
 
         st.stop()
 
-    # --------------------------------------------------------
-    # КНОПКА
-    # --------------------------------------------------------
 
     st.subheader(
-        "2️⃣ Получение данных Ozon"
+        "2️⃣ Получение данных Ozon API"
     )
 
-    start_button = st.button(
+    start = st.button(
         "🚀 Получить API и собрать PDF",
         type="primary",
         use_container_width=True
     )
 
-    if start_button:
+
+    if start:
 
         try:
 
@@ -1103,82 +1376,86 @@ if uploaded_file:
             # API
             # ------------------------------------------------
 
-            api_mapping, total_requests, total_postings = (
+            api_mapping, total_postings, requests_count = (
                 get_assembly_data_chunked(
-                    client_id=client_id,
-                    api_key=api_key,
-                    days_back=int(days_back),
-                    days_forward=int(days_forward),
-                    chunk_days=30
+                    client_id,
+                    api_key,
+                    int(days_back),
+                    int(days_forward),
+                    30
                 )
             )
 
-            unique_api = len([
-                x
-                for x in api_mapping
-                if not x.startswith(
+            unique_postings = len([
+                key
+                for key in api_mapping
+                if not key.startswith(
                     "__compact__"
                 )
             ])
 
             st.success(
-                f"Получено из API: "
+                f"Получено API: "
                 f"**{total_postings}** записей. "
                 f"Уникальных отправлений: "
-                f"**{unique_api}**. "
-                f"Запросов: **{total_requests}**."
+                f"**{unique_postings}**."
             )
 
+
             # ------------------------------------------------
-            # ПРЕДВАРИТЕЛЬНОЕ СОПОСТАВЛЕНИЕ
+            # Сопоставление
             # ------------------------------------------------
 
+            st.subheader(
+                "3️⃣ Сопоставление"
+            )
+
             preliminary_found = 0
-            preliminary_missing = []
+
+            preliminary_not_found = 0
 
             for record in label_records:
 
-                shipment = record["shipment"]
+                shipment = record[
+                    "shipment"
+                ]
 
                 if not shipment:
+
+                    preliminary_not_found += 1
                     continue
 
-                api_record = find_api_posting(
+                result = find_api_posting(
                     shipment,
                     api_mapping
                 )
 
-                if api_record:
+                if result:
                     preliminary_found += 1
-
                 else:
-                    preliminary_missing.append(
-                        shipment
-                    )
+                    preliminary_not_found += 1
 
-            st.subheader(
-                "3️⃣ Результат сопоставления"
-            )
 
-            col1, col2, col3 = st.columns(3)
+            c1, c2, c3 = st.columns(3)
 
-            col1.metric(
+            c1.metric(
                 "Этикеток",
                 total_pages
             )
 
-            col2.metric(
+            c2.metric(
                 "Найдено в API",
                 preliminary_found
             )
 
-            col3.metric(
-                "Нет в API",
-                len(preliminary_missing)
+            c3.metric(
+                "Не найдено",
+                preliminary_not_found
             )
 
+
             # ------------------------------------------------
-            # СОЗДАЁМ PDF
+            # PDF
             # ------------------------------------------------
 
             final_pdf, diagnostics, found, not_found = (
@@ -1188,6 +1465,7 @@ if uploaded_file:
                     label_records
                 )
             )
+
 
             # ------------------------------------------------
             # ИТОГ
@@ -1214,60 +1492,44 @@ if uploaded_file:
                 not_found
             )
 
+
             # ------------------------------------------------
-            # СПИСОК НЕ НАЙДЕННЫХ
+            # НЕ НАЙДЕННЫЕ
             # ------------------------------------------------
 
-            missing_rows = [
+            missing = [
                 x
                 for x in diagnostics
                 if x["API"] != "OK"
             ]
 
-            if missing_rows:
+            if missing:
 
                 st.warning(
                     f"Осталось не найдено: "
-                    f"**{len(missing_rows)}**"
-                )
-
-                st.write(
-                    "Эти номера были распознаны "
-                    "на этикетках, но не нашлись "
-                    "в результате запросов Ozon API:"
+                    f"**{len(missing)}**"
                 )
 
                 st.dataframe(
-                    missing_rows,
+                    missing,
                     use_container_width=True,
                     hide_index=True
-                )
-
-                # Текстовый список для копирования
-                missing_numbers = "\n".join(
-                    str(x["Отправление"])
-                    for x in missing_rows
-                )
-
-                st.text_area(
-                    "Номера для проверки",
-                    value=missing_numbers,
-                    height=200
                 )
 
             else:
 
                 st.success(
-                    "🎉 Все этикетки успешно "
-                    "сопоставлены с Ozon API!"
+                    "🎉 Все этикетки "
+                    "сопоставлены с API."
                 )
 
+
             # ------------------------------------------------
-            # ПОЛНАЯ ТАБЛИЦА
+            # ВСЕ
             # ------------------------------------------------
 
             with st.expander(
-                "📋 Показать все сопоставления"
+                "📋 Все сопоставления"
             ):
 
                 st.dataframe(
@@ -1276,12 +1538,13 @@ if uploaded_file:
                     hide_index=True
                 )
 
+
             # ------------------------------------------------
             # СКАЧИВАНИЕ
             # ------------------------------------------------
 
             st.download_button(
-                label="⬇️ Скачать Ready_Labels.pdf",
+                "⬇️ Скачать Ready_Labels.pdf",
                 data=final_pdf.getvalue(),
                 file_name="Ready_Labels.pdf",
                 mime="application/pdf",
@@ -1289,10 +1552,11 @@ if uploaded_file:
                 use_container_width=True
             )
 
+
         except Exception as e:
 
             st.error(
-                "❌ Ошибка при обработке:"
+                "❌ Ошибка:"
             )
 
             st.exception(e)

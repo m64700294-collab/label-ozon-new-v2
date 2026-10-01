@@ -18,7 +18,7 @@ import requests
 # ============================================================
 
 st.set_page_config(
-    page_title="Умная склейка этикеток Ozon",
+    page_title="Второй вариант склейки этикеток Ozon",
     page_icon="🖨️",
     layout="wide"
 )

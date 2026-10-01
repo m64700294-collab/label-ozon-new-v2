@@ -1,1412 +1,265 @@
 import streamlit as st
 import re
 import os
+import requests
 from io import BytesIO
+from datetime import datetime, timedelta
 
 from pypdf import PdfReader, PdfWriter
-import pdfplumber
-
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-import requests
-
-
 # ============================================================
-# НАСТРОЙКИ
+# НАСТРОЙКИ СТРАНИЦЫ
 # ============================================================
-
 st.set_page_config(
-    page_title="Ozon FBS — Этикетки + Лист подбора",
+    page_title="Ozon FBS — Этикетки (Авто-маппинг API)",
     page_icon="🖨️",
     layout="wide"
 )
 
-st.title("🖨️ Ozon FBS — Этикетки + Лист подбора")
-
-st.write(
-    "Маппинг: номер отправления → номер с этикетки → товар → артикул → количество"
-)
-
+st.title("🖨️ Ozon FBS — Умные этикетки (API)")
+st.write("Скрипт автоматически получает лист подбора по API и добавляет артикулы к этикеткам.")
 
 # ============================================================
 # ШРИФТ
 # ============================================================
-
 @st.cache_resource
 def load_font():
-
     font_path = "Roboto_Full_Final.ttf"
-
     if not os.path.exists(font_path):
-
-        url = (
-            "https://cdnjs.cloudflare.com/ajax/libs/"
-            "pdfmake/0.1.66/fonts/Roboto/Roboto-Regular.ttf"
-        )
-
-        response = requests.get(
-            url,
-            timeout=30
-        )
-
+        url = "https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.1.66/fonts/Roboto/Roboto-Regular.ttf"
+        response = requests.get(url, timeout=30)
         response.raise_for_status()
-
         with open(font_path, "wb") as f:
             f.write(response.content)
-
     try:
-        pdfmetrics.registerFont(
-            TTFont(
-                "OzonFont",
-                font_path
-            )
-        )
+        pdfmetrics.registerFont(TTFont("OzonFont", font_path))
     except Exception:
         pass
-
     return "OzonFont"
-
 
 font_name = load_font()
 
-
 # ============================================================
-# НОРМАЛИЗАЦИЯ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
-
 def normalize_shipment(value):
-
-    if not value:
-        return ""
-
+    if not value: return ""
     value = str(value)
-
-    value = re.sub(
-        r"\s+",
-        "",
-        value
-    )
-
-    value = (
-        value
-        .replace("І", "I")
-        .replace("і", "i")
-    )
-
+    value = re.sub(r"\s+", "", value)
+    value = value.replace("І", "I").replace("і", "i")
     return value.lower()
 
-
-# ============================================================
-# ГОРИЗОНТАЛЬНЫЕ ЛИНИИ (ОБНОВЛЕНО)
-# ============================================================
-
-def get_horizontal_lines(page):
-
-    result = []
-
-    page_width = float(page.width)
-
-    # --------------------------------------------------------
-    # 1. Обычные линии PDF
-    # --------------------------------------------------------
-
-    for line in page.lines:
-
-        x0 = float(line.get("x0", 0))
-        x1 = float(line.get("x1", 0))
-
-        y0 = float(line.get("y0", 0))
-        y1 = float(line.get("y1", 0))
-
-        # Только горизонтальные
-        if abs(y0 - y1) > 1:
-            continue
-
-        width = abs(x1 - x0)
-
-        # Для вашего Ozon PDF достаточно 30%
-        if width < page_width * 0.30:
-            continue
-
-        # !!! ВАЖНО !!!
-        # Используем готовую координату pdfplumber
-        if "top" in line:
-            top = float(line["top"])
-        else:
-            top = float(page.height) - y0
-
-        result.append(top)
-
-
-    # --------------------------------------------------------
-    # 2. Иногда Ozon хранит разделители как rect
-    # --------------------------------------------------------
-
-    for rect in page.rects:
-
-        x0 = float(rect.get("x0", 0))
-        x1 = float(rect.get("x1", 0))
-
-        y0 = float(rect.get("y0", 0))
-        y1 = float(rect.get("y1", 0))
-
-        width = abs(x1 - x0)
-        height = abs(y1 - y0)
-
-        if (
-            height <= 2
-            and
-            width >= page_width * 0.30
-        ):
-
-            if "top" in rect:
-                top = float(rect["top"])
-            else:
-                top = float(page.height) - y0
-
-            result.append(top)
-
-
-    # --------------------------------------------------------
-    # Убираем дубликаты
-    # --------------------------------------------------------
-
-    result.sort()
-
-    unique = []
-
-    for y in result:
-
-        if not unique:
-            unique.append(y)
-
-        elif abs(
-            y - unique[-1]
-        ) > 2:
-
-            unique.append(y)
-
-
-    return unique
-
-
-# ============================================================
-# ТЕКСТ МЕЖДУ ГОРИЗОНТАЛЬНЫМИ ЛИНИЯМИ (ОБНОВЛЕНО)
-# ============================================================
-
-def get_text_between_lines(
-    page,
-    words,
-    top,
-    bottom
-):
-
-    row_words = []
-
-    # --------------------------------------------------------
-    # Берём слово по ЦЕНТРУ, а не требуем целиком попасть
-    # между линиями.
-    # --------------------------------------------------------
-
-    for word in words:
-
-        word_top = float(
-            word["top"]
-        )
-
-        word_bottom = float(
-            word["bottom"]
-        )
-
-        word_center = (
-            word_top +
-            word_bottom
-        ) / 2
-
-
-        if (
-            word_center > top + 2
-            and
-            word_center < bottom - 2
-        ):
-
-            row_words.append(
-                word
-            )
-
-
-    if not row_words:
-        return ""
-
-
-    # --------------------------------------------------------
-    # Сначала сортируем по вертикали
-    # --------------------------------------------------------
-
-    row_words.sort(
-        key=lambda w: (
-            float(w["top"]),
-            float(w["x0"])
-        )
-    )
-
-
-    lines = []
-
-    current_line = []
-
-    current_y = None
-
-
-    for word in row_words:
-
-        y = float(
-            word["top"]
-        )
-
-        if (
-            current_y is None
-            or
-            abs(
-                y - current_y
-            ) <= 3
-        ):
-
-            current_line.append(
-                word
-            )
-
-        else:
-
-            current_line.sort(
-                key=lambda w: float(
-                    w["x0"]
-                )
-            )
-
-            lines.append(
-                " ".join(
-                    w["text"]
-                    for w in current_line
-                )
-            )
-
-            current_line = [
-                word
-            ]
-
-
-        current_y = y
-
-
-    if current_line:
-
-        current_line.sort(
-            key=lambda w: float(
-                w["x0"]
-            )
-        )
-
-        lines.append(
-            " ".join(
-                w["text"]
-                for w in current_line
-            )
-        )
-
-
-    return "\n".join(
-        lines
-    )
-
-
-# ============================================================
-# УДАЛЕНИЕ СЛУЖЕБНОГО МУСОРА
-# ============================================================
-
-def clean_row_text(text):
-
-    if not text:
-        return ""
-
-
-    # Убираем заголовки
-    text = re.sub(
-        r"\bФото\b",
-        " ",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    text = re.sub(
-        r"\bТовар\b",
-        " ",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    text = re.sub(
-        r"\bАртикул\b",
-        " ",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    text = re.sub(
-        r"\bКол-во\b",
-        " ",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    text = re.sub(
-        r"\bЭтикетка\b",
-        " ",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
-
-    return text.strip()
-
-
-# ============================================================
-# ПОИСК ХВОСТА:
-#
-# АРТИКУЛ → КОЛИЧЕСТВО → ЭТИКЕТКА
-# ============================================================
-
-def parse_product_tail(text):
-
-    if not text:
-        return None
-
-    tokens = text.split()
-
-    if len(tokens) < 3:
-        return None
-
-
-    # --------------------------------------------------------
-    # Ищем 4 цифры справа налево
-    # --------------------------------------------------------
-
-    label_index = None
-    label = None
-
-
-    for i in range(
-        len(tokens) - 1,
-        -1,
-        -1
-    ):
-
-        token = tokens[i].strip()
-
-
-        # Нормальный случай
-        if re.fullmatch(
-            r"\d{4}",
-            token
-        ):
-
-            label_index = i
-            label = token
-
-            break
-
-
-    if label_index is None:
-
-        # ----------------------------------------------------
-        # Редкий случай:
-        # PDF склеил: 1 8886 в: 18886
-        # ----------------------------------------------------
-
-        for i in range(
-            len(tokens) - 1,
-            -1,
-            -1
-        ):
-
-            token = tokens[i].strip()
-
-            if not re.fullmatch(
-                r"\d{5,8}",
-                token
-            ):
-                continue
-
-
-            possible_label = token[-4:]
-            possible_qty = token[:-4]
-
-
-            if re.fullmatch(
-                r"\d{1,4}",
-                possible_qty
-            ):
-
-                label_index = i
-                label = possible_label
-
-                qty = possible_qty
-
-                article_index = i - 1
-
-                break
-
-        else:
-
-            return None
-
-
-    # --------------------------------------------------------
-    # Обычный вариант
-    # --------------------------------------------------------
-
-    if "qty" not in locals():
-
-        qty_index = label_index - 1
-
-        if qty_index < 0:
-            return None
-
-
-        qty = tokens[
-            qty_index
-        ]
-
-
-        if not re.fullmatch(
-            r"\d{1,4}",
-            qty
-        ):
-
-            return None
-
-
-        article_index = (
-            qty_index - 1
-        )
-
-
-    if article_index < 0:
-        return None
-
-
-    article = tokens[
-        article_index
-    ]
-
-
-    # --------------------------------------------------------
-    # Иногда перед артикулом стоит № строки
-    # --------------------------------------------------------
-
-    if re.fullmatch(
-        r"\d+",
-        article
-    ):
-
-        article_index -= 1
-
-        if article_index < 0:
-            return None
-
-        article = tokens[
-            article_index
-        ]
-
-
-    # --------------------------------------------------------
-    # Название товара
-    # --------------------------------------------------------
-
-    name = " ".join(
-        tokens[
-            :article_index
-        ]
-    )
-
-
-    # Убираем порядковый номер
-    name = re.sub(
-        r"^\s*\d+\s+",
-        "",
-        name
-    )
-
-
-    name = re.sub(
-        r"\s+",
-        " ",
-        name
-    ).strip()
-
-
-    if not name:
-        name = "Товар"
-
-
-    return {
-        "article": article,
-        "qty": qty,
-        "label": label,
-        "name": name
-    }
-
-
-# ============================================================
-# ПАРСИНГ ОДНОЙ ПОЗИЦИИ
-# ============================================================
-
-def parse_row(text):
-
-    if not text:
-        return None
-
-
-    # --------------------------------------------------------
-    # Номер отправления
-    # --------------------------------------------------------
-
-    shipment_matches = re.findall(
-        r"\d{8,15}-\d{4}-\d+",
-        text
-    )
-
-
-    if not shipment_matches:
-        return None
-
-
-    shipment = normalize_shipment(
-        shipment_matches[0]
-    )
-
-
-    # --------------------------------------------------------
-    # Убираем номер отправления
-    # --------------------------------------------------------
-
-    work = text
-
-    for shipment_number in shipment_matches:
-
-        work = work.replace(
-            shipment_number,
-            " "
-        )
-
-
-    # --------------------------------------------------------
-    # Убираем ii500...
-    #
-    # ВАЖНО:
-    # это номер с этикетки,
-    # НЕ номер отправления.
-    # --------------------------------------------------------
-
-    work = re.sub(
-        r"\b[iiіі]{2}\d{8,20}\b",
-        " ",
-        work,
-        flags=re.IGNORECASE
-    )
-
-
-    work = clean_row_text(
-        work
-    )
-
-
-    if not work:
-        return None
-
-
-    # --------------------------------------------------------
-    # Разбираем хвост
-    # --------------------------------------------------------
-
-    product = parse_product_tail(
-        work
-    )
-
-
-    if not product:
-        return None
-
-
-    return {
-        "shipment": shipment,
-        "label": product["label"],
-        "name": product["name"],
-        "article": product["article"],
-        "qty": product["qty"]
-    }
-
-
-# ============================================================
-# ОСНОВНОЙ ПАРСЕР ЛИСТА ПОДБОРА (ОБНОВЛЕНО)
-# ============================================================
-
-@st.cache_data(show_spinner=False)
-def parse_assembly_list(pdf_bytes):
-
-    data = {}
-
-    diagnostics = []
-
-
-    with pdfplumber.open(
-        BytesIO(pdf_bytes)
-    ) as pdf:
-
-
-        total_pages = len(
-            pdf.pages
-        )
-
-
-        for page_number, page in enumerate(
-            pdf.pages,
-            start=1
-        ):
-
-
-            # ==================================================
-            # ЛИНИИ
-            # ==================================================
-
-            lines = get_horizontal_lines(
-                page
-            )
-
-
-            # ==================================================
-            # СЛОВА
-            # ==================================================
-
-            words = page.extract_words(
-                x_tolerance=2,
-                y_tolerance=3,
-                keep_blank_chars=False
-            )
-
-
-            if not words:
-
-                diagnostics.append({
-                    "Страница": page_number,
-                    "Горизонтальных линий": len(lines),
-                    "Сформировано строк": 0,
-                    "Найдено отправлений": 0
-                })
-
-                continue
-
-
-            # ==================================================
-            # ВАЖНО:
-            #
-            # линии должны быть настоящими границами строк.
-            #
-            # Добавляем верх и низ страницы.
-            # ==================================================
-
-            boundaries = [
-                0
-            ]
-
-            boundaries.extend(
-                lines
-            )
-
-            boundaries.append(
-                float(page.height)
-            )
-
-
-            # --------------------------------------------------
-            # Убираем дубликаты
-            # --------------------------------------------------
-
-            boundaries = sorted(
-                set(
-                    round(x, 2)
-                    for x in boundaries
-                )
-            )
-
-
-            page_rows = 0
-            page_found = 0
-
-
-            # ==================================================
-            # ИДЁМ МЕЖДУ СОСЕДНИМИ ЛИНИЯМИ
-            # ==================================================
-
-            for i in range(
-                len(boundaries) - 1
-            ):
-
-                top = boundaries[i]
-                bottom = boundaries[i + 1]
-
-
-                # Слишком маленький участок
-                if (
-                    bottom - top
-                    < 8
-                ):
-                    continue
-
-
-                row_text = get_text_between_lines(
-                    page,
-                    words,
-                    top,
-                    bottom
-                )
-
-
-                if not row_text:
-                    continue
-
-
-                page_rows += 1
-
-
-                # ==================================================
-                # Ищем номер отправления
-                # ==================================================
-
-                result = parse_row(
-                    row_text
-                )
-
-
-                if result:
-
-                    shipment = result[
-                        "shipment"
-                    ]
-
-
-                    if shipment not in data:
-
-                        data[
-                            shipment
-                        ] = result
-
-
-                    page_found += 1
-
-
-            diagnostics.append({
-
-                "Страница":
-                    page_number,
-
-                "Горизонтальных линий":
-                    len(lines),
-
-                "Сформировано строк":
-                    page_rows,
-
-                "Найдено отправлений":
-                    page_found
-            })
-
-
-    # ============================================================
-    # ДИАГНОСТИКА
-    # ============================================================
-
-    st.subheader(
-        "📊 Диагностика листа подбора"
-    )
-
-
-    col1, col2, col3 = st.columns(3)
-
-
-    with col1:
-
-        st.metric(
-            "Страниц",
-            total_pages
-        )
-
-
-    with col2:
-
-        st.metric(
-            "Найдено отправлений",
-            len(data)
-        )
-
-
-    with col3:
-
-        st.metric(
-            "Ожидается",
-            236
-        )
-
-
-    with st.expander(
-        "🔍 Диагностика страниц",
-        expanded=True
-    ):
-
-        st.dataframe(
-            diagnostics,
-            use_container_width=True,
-            hide_index=True
-        )
-
-
-    # ============================================================
-    # МАППИНГ
-    # ============================================================
-
-    if data:
-
-        mapping = []
-
-
-        for shipment, item in data.items():
-
-            mapping.append({
-
-                "№ отправления":
-                    shipment,
-
-                "№ с этикетки":
-                    item["label"],
-
-                "Артикул":
-                    item["article"],
-
-                "Кол-во":
-                    item["qty"],
-
-                "Товар":
-                    item["name"]
-            })
-
-
-        with st.expander(
-            f"🔗 Маппинг — {len(mapping)} отправлений",
-            expanded=True
-        ):
-
-            st.dataframe(
-                mapping,
-                use_container_width=True,
-                hide_index=True
-            )
-
-
-    else:
-
-        st.error(
-            "Линии найдены, но текст не попал в области между линиями."
-        )
-
-
-    return data
-
-
-# ============================================================
-# НОМЕР ОТПРАВЛЕНИЯ НА ЭТИКЕТКЕ
-# ============================================================
-
 def extract_shipment_from_label(page):
-
     text = page.extract_text()
-
-    if not text:
-        return None
-
-    # --------------------------------------------------------
-    # Основной формат:
-    # 78277691-0407-1
-    # --------------------------------------------------------
-
-    match = re.search(
-        r"\d{8,15}-\d{4}-\d+",
-        text
-    )
-
-    if match:
-        return normalize_shipment(
-            match.group(0)
-        )
-
-    # --------------------------------------------------------
-    # ii...
-    # --------------------------------------------------------
-
-    clean = re.sub(
-        r"\s+",
-        "",
-        text
-    )
-
-    match = re.search(
-        r"ii\d{8,20}",
-        clean,
-        flags=re.IGNORECASE
-    )
-
-    if match:
-        return normalize_shipment(
-            match.group(0)
-        )
-
-
+    if not text: return None
+    match = re.search(r"\d{8,15}-\d{4}-\d+", text)
+    if match: return normalize_shipment(match.group(0))
+    clean = re.sub(r"\s+", "", text)
+    match = re.search(r"ii\d{8,20}", clean, flags=re.IGNORECASE)
+    if match: return normalize_shipment(match.group(0))
     return None
 
+# ============================================================
+# API OZON (ЗАМЕНА ПАРСИНГУ PDF)
+# ============================================================
+def get_assembly_data_from_api(client_id: str, api_key: str, days_back: int = 5, days_forward: int = 5):
+    url = "https://api-seller.ozon.ru/v1/assembly/fbs/posting/list"
+    headers = {
+        "Client-Id": client_id,
+        "Api-Key": api_key,
+        "Content-Type": "application/json"
+    }
+    
+    now = datetime.utcnow()
+    cutoff_from = (now - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cutoff_to = (now + timedelta(days=days_forward)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    
+    data_mapping = {}
+    cursor = ""
+    
+    while True:
+        payload = {
+            "filter": {
+                "cutoff_from": cutoff_from,
+                "cutoff_to": cutoff_to
+            },
+            "limit": 1000,
+            "sort_dir": "ASC"
+        }
+        if cursor:
+            payload["cursor"] = cursor
+            
+        response = requests.post(url, headers=headers, json=payload)
+        if response.status_code != 200:
+            raise Exception(f"Ошибка API Ozon: {response.text}")
+            
+        result = response.json()
+        postings = result.get("postings", [])
+        
+        for posting in postings:
+            posting_number = posting.get("posting_number")
+            products = posting.get("products", [])
+            
+            names = []
+            articles = []
+            total_qty = 0
+            
+            for prod in products:
+                names.append(prod.get("product_name", ""))
+                articles.append(str(prod.get("offer_id", "")))
+                total_qty += prod.get("quantity", 0)
+            
+            key = posting_number.lower()
+            data_mapping[key] = {
+                "shipment": posting_number,
+                "article": " + ".join(articles),
+                "qty": str(total_qty),
+                "name": " + ".join(names),
+                "label": "-"
+            }
+            
+        cursor = result.get("cursor")
+        if not cursor:
+            break
+            
+    return data_mapping
 
 # ============================================================
-# ИНФОРМАЦИОННАЯ СТРАНИЦА
+# ГЕНЕРАЦИЯ СТРАНИЦЫ С ИНФОРМАЦИЕЙ
 # ============================================================
-
-def create_info_label(
-    width,
-    height,
-    order_number,
-    product_info
-):
-
+def create_info_label(width, height, order_number, product_info):
     packet = BytesIO()
-
-    c = canvas.Canvas(
-        packet,
-        pagesize=(
-            width,
-            height
-        )
-    )
-
+    c = canvas.Canvas(packet, pagesize=(width, height))
     margin = 10
 
-    # --------------------------------------------------------
     # Заказ
-    # --------------------------------------------------------
+    c.setFont(font_name, 9)
+    c.drawString(margin, height - 16, f"Заказ: {order_number}")
+    c.line(margin, height - 20, width - margin, height - 20)
 
-    c.setFont(
-        font_name,
-        9
-    )
+    # Этикетка (заглушка для API)
+    c.setFont(font_name, 9)
+    c.drawString(margin, height - 32, f"Этикетка: {product_info.get('label', '-')}")
 
-    c.drawString(
-        margin,
-        height - 16,
-        f"Заказ: {order_number}"
-    )
-
-    c.line(
-        margin,
-        height - 20,
-        width - margin,
-        height - 20
-    )
-
-
-    # --------------------------------------------------------
-    # Номер с этикетки
-    # --------------------------------------------------------
-
-    label = product_info.get(
-        "label",
-        "-"
-    )
-
-    c.setFont(
-        font_name,
-        9
-    )
-
-    c.drawString(
-        margin,
-        height - 32,
-        f"Этикетка: {label}"
-    )
-
-
-    # --------------------------------------------------------
     # Артикул
-    # --------------------------------------------------------
+    c.setFont(font_name, 11)
+    c.drawString(margin, height - 47, f"Арт: {product_info.get('article', '-')}")
 
-    article = product_info.get(
-        "article",
-        "-"
-    )
-
-    c.setFont(
-        font_name,
-        11
-    )
-
-    c.drawString(
-        margin,
-        height - 47,
-        f"Арт: {article}"
-    )
-
-
-    # --------------------------------------------------------
-    # Название
-    # --------------------------------------------------------
-
-    name = product_info.get(
-        "name",
-        "Товар не найден"
-    )
-
+    # Название товара
+    name = product_info.get("name", "Товар не найден")
     top = height - 63
     bottom = 48
-
     font_size = 9
     line_height = 11
 
-    def split_text(
-        text,
-        chars
-    ):
-
+    def split_text(text, chars):
         words = text.split()
         result = []
         current = ""
-
         for word in words:
-
-            test = (
-                current +
-                word +
-                " "
-            )
-
-            if len(test) <= chars:
-                current = test
+            test = current + word + " "
+            if len(test) <= chars: current = test
             else:
-                if current:
-                    result.append(
-                        current.strip()
-                    )
-                current = (
-                    word +
-                    " "
-                )
-
-        if current:
-            result.append(
-                current.strip()
-            )
-
+                if current: result.append(current.strip())
+                current = word + " "
+        if current: result.append(current.strip())
         return result
 
-    lines = split_text(
-        name,
-        30
-    )
-
-    while (
-        len(lines) * line_height
-        > top - bottom
-        and
-        font_size > 6
-    ):
-
+    lines = split_text(name, 30)
+    while (len(lines) * line_height > top - bottom and font_size > 6):
         font_size -= 0.5
         line_height -= 0.5
+        lines = split_text(name, max(20, int(30 * 9 / font_size)))
 
-        lines = split_text(
-            name,
-            max(
-                20,
-                int(
-                    30 *
-                    9 /
-                    font_size
-                )
-            )
-        )
-
-    c.setFont(
-        font_name,
-        font_size
-    )
-
+    c.setFont(font_name, font_size)
     y = top
-
     for line in lines:
-        if y <= bottom:
-            break
-        c.drawString(
-            margin,
-            y,
-            line
-        )
+        if y <= bottom: break
+        c.drawString(margin, y, line)
         y -= line_height
 
-    # --------------------------------------------------------
     # Количество
-    # --------------------------------------------------------
-
-    qty = product_info.get(
-        "qty",
-        "?"
-    )
-
-    c.setFont(
-        font_name,
-        22
-    )
-
-    c.drawString(
-        margin,
-        14,
-        f"КОЛ-ВО: {qty}"
-    )
+    c.setFont(font_name, 22)
+    c.drawString(margin, 14, f"КОЛ-ВО: {product_info.get('qty', '?')}")
 
     c.save()
-
     packet.seek(0)
-
-    return PdfReader(
-        packet
-    ).pages[0]
-
+    return PdfReader(packet).pages[0]
 
 # ============================================================
-# UI
+# UI: ПОЛЯ ВВОДА И КНОПКИ
 # ============================================================
+st.sidebar.header("🔑 Настройки API Ozon")
+client_id = st.sidebar.text_input("Client-Id")
+api_key = st.sidebar.text_input("Api-Key", type="password")
 
 col1, col2 = st.columns(2)
-
 with col1:
-
-    labels_file = st.file_uploader(
-        "1️⃣ Этикетки Ozon",
-        type=["pdf"]
-    )
-
-
+    labels_file = st.file_uploader("1️⃣ Этикетки Ozon (PDF)", type=["pdf"])
 with col2:
-
-    assembly_file = st.file_uploader(
-        "2️⃣ Лист подбора Ozon",
-        type=["pdf"]
-    )
-
+    st.info("💡 Лист подбора загружать не нужно. Скрипт сам заберет данные из вашего кабинета через API.")
 
 # ============================================================
-# СКЛЕЙКА
+# ОСНОВНАЯ ЛОГИКА
 # ============================================================
-
-if labels_file and assembly_file:
-
-    if st.button(
-        "🚀 Склеить файлы",
-        type="primary",
-        use_container_width=True
-    ):
-
-        with st.status(
-            "Разбираем лист подбора..."
-        ) as status:
-
-            # ==================================================
-            # ЛИСТ ПОДБОРА
-            # ==================================================
-
-            assembly_bytes = (
-                assembly_file.getvalue()
-            )
-
-            assembly_data = parse_assembly_list(
-                assembly_bytes
-            )
-
-            if not assembly_data:
-
-                status.update(
-                    label="Не удалось распознать лист подбора",
-                    state="error"
-                )
-
+if labels_file and client_id and api_key:
+    if st.button("🚀 Склеить файлы", type="primary", use_container_width=True):
+        
+        with st.status("Получаем данные от Ozon...") as status:
+            try:
+                assembly_data = get_assembly_data_from_api(client_id, api_key)
+                if not assembly_data:
+                    status.update(label="Отправления не найдены по API", state="error")
+                    st.stop()
+                status.update(label=f"Успешно получено {len(assembly_data)} отправлений из API. Разбираем этикетки...")
+            except Exception as e:
+                status.update(label=f"Ошибка API: {str(e)}", state="error")
                 st.stop()
 
-
-            # ==================================================
-            # ЭТИКЕТКИ
-            # ==================================================
-
-            status.update(
-                label="Разбираем этикетки..."
-            )
-
-            labels_bytes = (
-                labels_file.getvalue()
-            )
-
-            reader = PdfReader(
-                BytesIO(
-                    labels_bytes
-                )
-            )
-
+            labels_bytes = labels_file.getvalue()
+            reader = PdfReader(BytesIO(labels_bytes))
             writer = PdfWriter()
 
-            found = 0
-            not_found = 0
-            unknown = 0
-
-
-            # ==================================================
-            # КАЖДАЯ ЭТИКЕТКА
-            # ==================================================
+            found, not_found, unknown = 0, 0, 0
 
             for page in reader.pages:
-
-                # ------------------------------------------------
-                # Оригинальная страница
-                # ------------------------------------------------
-
-                writer.add_page(
-                    page
-                )
-
-                # ------------------------------------------------
-                # Номер отправления
-                # ------------------------------------------------
-
-                shipment = (
-                    extract_shipment_from_label(
-                        page
-                    )
-                )
-
-                width = float(
-                    page.mediabox.width
-                )
-
-                height = float(
-                    page.mediabox.height
-                )
-
-                # =================================================
-                # Совпадение
-                # =================================================
+                writer.add_page(page)
+                shipment = extract_shipment_from_label(page)
+                width = float(page.mediabox.width)
+                height = float(page.mediabox.height)
 
                 if shipment:
-
-                    info = assembly_data.get(
-                        shipment
-                    )
-
+                    info = assembly_data.get(shipment.lower())
                     if info:
-
                         found += 1
-
-                        display_number = (
-                            shipment.upper()
-                        )
-
+                        display_number = info["shipment"].upper()
                     else:
-
                         not_found += 1
-
-                        display_number = (
-                            shipment.upper()
-                        )
-
-                        info = {
-                            "label": "-",
-                            "article": "-",
-                            "qty": "?",
-                            "name":
-                                "ОТПРАВЛЕНИЕ НЕ НАЙДЕНО "
-                                "В ЛИСТЕ ПОДБОРА"
-                        }
-
-                # =================================================
-                # Номер не найден
-                # =================================================
-
+                        display_number = shipment.upper()
+                        info = {"label": "-", "article": "-", "qty": "?", "name": "ОТПРАВЛЕНИЕ НЕ НАЙДЕНО В API"}
                 else:
-
                     unknown += 1
-
                     display_number = "???"
+                    info = {"label": "-", "article": "-", "qty": "-", "name": "НОМЕР НЕ РАСПОЗНАН НА ЭТИКЕТКЕ"}
 
-                    info = {
-                        "label": "-",
-                        "article": "-",
-                        "qty": "-",
-                        "name":
-                            "НОМЕР ОТПРАВЛЕНИЯ "
-                            "НЕ РАСПОЗНАН"
-                    }
+                writer.add_page(create_info_label(width, height, display_number, info))
 
-                # =================================================
-                # Добавляем информационный лист
-                # =================================================
-
-                writer.add_page(
-                    create_info_label(
-                        width,
-                        height,
-                        display_number,
-                        info
-                    )
-                )
-
-
-            # ==================================================
-            # ГОТОВО
-            # ==================================================
-
-            status.update(
-                label=(
-                    f"Готово. "
-                    f"Совпало: {found}; "
-                    f"не найдено: {not_found}; "
-                    f"не распознано: {unknown}"
-                ),
-                state="complete"
-            )
-
-
-        # ======================================================
-        # PDF
-        # ======================================================
+            status.update(label=f"Готово! Найдено: {found}, Не найдено: {not_found}, Не распознано: {unknown}", state="complete")
 
         output = BytesIO()
-
-        writer.write(
-            output
-        )
-
+        writer.write(output)
         output.seek(0)
 
         st.download_button(
-            "📥 Скачать Ready_Labels.pdf",
+            "📥 Скачать готовые этикетки",
             output,
             "Ready_Labels.pdf",
             "application/pdf",
             use_container_width=True
         )
+
+elif labels_file:
+    st.warning("Введите Client-Id и Api-Key в боковой панели слева.")

@@ -1,7 +1,9 @@
 import streamlit as st
 import requests
-import re
 import io
+import time
+import base64
+
 from datetime import datetime, timedelta
 
 from pypdf import PdfReader, PdfWriter
@@ -11,47 +13,61 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 
 # ============================================================
-# НАСТРОЙКА
+# CONFIG
 # ============================================================
 
 st.set_page_config(
-    page_title="Ozon FBS — Этикетки + API",
-    page_icon="🖨️",
+    page_title="Ozon FBS — Отправления и этикетки",
+    page_icon="🏷️",
     layout="wide"
 )
 
 
+API_BASE = "https://api-seller.ozon.ru"
+
+POSTINGS_URL = (
+    API_BASE +
+    "/v1/assembly/fbs/posting/list"
+)
+
+LABEL_URL = (
+    API_BASE +
+    "/v2/posting/fbs/package-label"
+)
+
+
 # ============================================================
-# ШРИФТ
+# FONTS
 # ============================================================
 
 def register_fonts():
 
+    regular = "Helvetica"
+    bold = "Helvetica-Bold"
+
     paths = [
         (
-            "DejaVuSans",
+            "AppFont",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
         ),
         (
-            "DejaVuSansBold",
+            "AppFontBold",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        ),
+        )
     ]
-
-    regular = "Helvetica"
-    bold = "Helvetica-Bold"
 
     for name, path in paths:
 
         try:
+
             pdfmetrics.registerFont(
                 TTFont(name, path)
             )
 
-            if name == "DejaVuSans":
+            if name == "AppFont":
                 regular = name
 
-            if name == "DejaVuSansBold":
+            if name == "AppFontBold":
                 bold = name
 
         except Exception:
@@ -64,297 +80,69 @@ FONT_REGULAR, FONT_BOLD = register_fonts()
 
 
 # ============================================================
-# НОРМАЛИЗАЦИЯ
+# HELPERS
 # ============================================================
 
-def normalize_text(value):
+def normalize(value):
 
     if value is None:
         return ""
 
-    value = str(value)
-
-    value = (
-        value
-        .replace("\n", " ")
-        .replace("\r", " ")
-        .replace("\t", " ")
-        .replace("—", "-")
-        .replace("–", "-")
-        .replace("−", "-")
-    )
-
-    value = re.sub(
-        r"\s+",
-        " ",
-        value
-    )
-
-    return value.strip()
+    return str(value).strip()
 
 
-def normalize_shipment(value):
+def chunks(items, size):
 
-    value = normalize_text(value)
-
-    value = value.lower()
-
-    value = re.sub(
-        r"\s+",
-        "",
-        value
-    )
-
-    return value
-
-
-def compact_shipment(value):
-
-    value = normalize_shipment(value)
-
-    return re.sub(
-        r"[^0-9a-zа-яё]",
-        "",
-        value
-    )
+    for i in range(
+        0,
+        len(items),
+        size
+    ):
+        yield items[
+            i:i + size
+        ]
 
 
 # ============================================================
-# ПОИСК НОМЕРА НА ЭТИКЕТКЕ
+# API REQUEST
 # ============================================================
 
-def find_possible_numbers(text):
+def api_headers(
+    client_id,
+    api_key
+):
 
-    """
-    Ищем максимально широкий набор вариантов.
+    return {
+        "Client-Id": str(
+            client_id
+        ).strip(),
 
-    Важно:
-    сначала ищем полноценный номер Ozon,
-    потом более общие комбинации.
-    """
+        "Api-Key": str(
+            api_key
+        ).strip(),
 
-    if not text:
-        return []
-
-    text = normalize_text(text)
-
-    candidates = []
-
-    patterns = [
-
-        # ----------------------------------------------------
-        # Классический Ozon:
-        # 12345678-0000-1
-        # ----------------------------------------------------
-
-        r"\b\d{8,15}-\d{3,8}-\d{1,8}\b",
-
-        # 123456789-0000-1
-        r"\b\d{7,16}-\d{3,8}-\d{1,8}\b",
-
-        # ----------------------------------------------------
-        # Варианты с пробелами вокруг дефиса
-        # ----------------------------------------------------
-
-        r"\b\d{7,16}\s*-\s*\d{3,8}\s*-\s*\d{1,8}\b",
-
-        # ----------------------------------------------------
-        # Любая длинная цепочка из цифр и дефисов
-        # ----------------------------------------------------
-
-        r"\b\d{7,16}(?:\s*-\s*\d{1,10}){1,4}\b",
-
-        # ----------------------------------------------------
-        # Если PDF разделил номер пробелами
-        # ----------------------------------------------------
-
-        r"\b\d{7,16}\s+\d{3,10}\s+\d{1,10}\b",
-    ]
-
-    for pattern in patterns:
-
-        matches = re.findall(
-            pattern,
-            text
-        )
-
-        for match in matches:
-
-            candidate = normalize_shipment(
-                match
-            )
-
-            candidate = re.sub(
-                r"\s*-\s*",
-                "-",
-                candidate
-            )
-
-            if candidate not in candidates:
-                candidates.append(candidate)
-
-    return candidates
-
-
-def extract_shipment_from_label(page):
-
-    try:
-        text = page.extract_text() or ""
-    except Exception:
-        text = ""
-
-    if not text:
-        return None, "", []
-
-
-    # ========================================================
-    # ВАРИАНТ 1 — ПОЛНОЦЕННЫЕ НОМЕРА
-    # ========================================================
-
-    candidates = find_possible_numbers(
-        text
-    )
-
-    if candidates:
-
-        # Предпочитаем самый длинный
-        candidates_sorted = sorted(
-            candidates,
-            key=lambda x: (
-                x.count("-"),
-                len(x)
-            ),
-            reverse=True
-        )
-
-        return (
-            candidates_sorted[0],
-            text,
-            candidates_sorted
-        )
-
-
-    # ========================================================
-    # ВАРИАНТ 2 — ИЩЕМ РЯДОМ СО СЛОВАМИ
-    # ========================================================
-
-    lines = [
-        x.strip()
-        for x in text.splitlines()
-        if x.strip()
-    ]
-
-    keywords = [
-        "отправление",
-        "отправлен",
-        "номер",
-        "заказ",
-        "order",
-        "posting",
-        "shipment",
-        "ozon"
-    ]
-
-    for i, line in enumerate(lines):
-
-        low = line.lower()
-
-        if any(
-            keyword in low
-            for keyword in keywords
-        ):
-
-            # Сама строка
-            local_candidates = find_possible_numbers(
-                line
-            )
-
-            if local_candidates:
-
-                return (
-                    local_candidates[0],
-                    text,
-                    local_candidates
-                )
-
-            # Следующая строка
-            if i + 1 < len(lines):
-
-                local_candidates = find_possible_numbers(
-                    lines[i + 1]
-                )
-
-                if local_candidates:
-
-                    return (
-                        local_candidates[0],
-                        text,
-                        local_candidates
-                    )
-
-
-    # ========================================================
-    # ВАРИАНТ 3 — ДЛИННЫЕ ЧИСЛА
-    # ========================================================
-
-    long_numbers = re.findall(
-        r"\b\d{10,18}\b",
-        text
-    )
-
-    if long_numbers:
-
-        # Убираем очевидные служебные номера
-        filtered = []
-
-        for number in long_numbers:
-
-            if len(number) < 10:
-                continue
-
-            filtered.append(
-                number
-            )
-
-        if filtered:
-
-            # Сохраняем кандидатов,
-            # но НЕ считаем это надёжным
-            return (
-                filtered[0],
-                text,
-                filtered
-            )
-
-
-    return None, text, []
+        "Content-Type":
+            "application/json"
+    }
 
 
 # ============================================================
-# API OZON
+# 1. ПОЛУЧАЕМ ОТПРАВЛЕНИЯ
 # ============================================================
 
-API_URL = (
-    "https://api-seller.ozon.ru/"
-    "v1/assembly/fbs/posting/list"
-)
-
-
-def api_request(
+def get_postings(
     client_id,
     api_key,
     date_from,
-    date_to,
-    limit=1000
+    date_to
 ):
 
-    headers = {
-        "Client-Id": str(client_id).strip(),
-        "Api-Key": str(api_key).strip(),
-        "Content-Type": "application/json"
-    }
+    headers = api_headers(
+        client_id,
+        api_key
+    )
 
-    postings_all = []
+    all_postings = []
 
     cursor = ""
 
@@ -365,7 +153,9 @@ def api_request(
                 "cutoff_from": date_from,
                 "cutoff_to": date_to
             },
-            "limit": limit,
+
+            "limit": 1000,
+
             "sort_dir": "ASC"
         }
 
@@ -373,7 +163,7 @@ def api_request(
             payload["cursor"] = cursor
 
         response = requests.post(
-            API_URL,
+            POSTINGS_URL,
             headers=headers,
             json=payload,
             timeout=60
@@ -387,8 +177,9 @@ def api_request(
                 error = response.text
 
             raise RuntimeError(
-                f"Ozon API HTTP "
-                f"{response.status_code}: {error}"
+                "Ошибка получения отправлений: "
+                f"HTTP {response.status_code}\n"
+                f"{error}"
             )
 
         data = response.json()
@@ -401,7 +192,7 @@ def api_request(
         if not postings:
             break
 
-        postings_all.extend(
+        all_postings.extend(
             postings
         )
 
@@ -417,33 +208,42 @@ def api_request(
 
         cursor = next_cursor
 
-        if len(postings) < limit:
+        if len(postings) < 1000:
             break
 
-    return postings_all
+    return all_postings
 
 
 # ============================================================
-# POSTING → RECORD
+# 2. ПРЕОБРАЗУЕМ ОТПРАВЛЕНИЕ
 # ============================================================
 
-def posting_to_record(posting):
+def convert_posting(
+    posting
+):
 
     posting_number = (
-        posting.get("posting_number")
-        or posting.get("order_number")
-        or posting.get("postingNumber")
-        or ""
+        posting.get(
+            "posting_number"
+        )
+        or
+        posting.get(
+            "order_number"
+        )
+        or
+        ""
     )
 
     products = (
-        posting.get("products")
-        or posting.get("items")
+        posting.get(
+            "products"
+        )
         or []
     )
 
-    names = []
     articles = []
+    names = []
+
     quantities = []
 
     for product in products:
@@ -454,325 +254,345 @@ def posting_to_record(posting):
         ):
             continue
 
-        name = (
-            product.get("name")
-            or product.get("product_name")
-            or ""
+        article = (
+            product.get(
+                "offer_id"
+            )
+            or
+            product.get(
+                "offerId"
+            )
+            or
+            product.get(
+                "sku"
+            )
+            or
+            ""
         )
 
-        article = (
-            product.get("offer_id")
-            or product.get("offerId")
-            or product.get("sku")
-            or product.get("article")
-            or ""
+        name = (
+            product.get(
+                "name"
+            )
+            or
+            product.get(
+                "product_name"
+            )
+            or
+            ""
         )
 
         quantity = (
-            product.get("quantity")
-            or product.get("qty")
+            product.get(
+                "quantity"
+            )
             or 0
         )
-
-        if name:
-            names.append(
-                str(name)
-            )
 
         if article:
             articles.append(
                 str(article)
             )
 
+        if name:
+            names.append(
+                str(name)
+            )
+
         try:
+
             quantities.append(
                 float(quantity)
             )
+
         except Exception:
             pass
 
-    total_qty = sum(
+    total_quantity = sum(
         quantities
     )
 
-    if total_qty.is_integer():
-        total_qty = int(total_qty)
+    if total_quantity.is_integer():
+        total_quantity = int(
+            total_quantity
+        )
 
     return {
-        "shipment": str(
-            posting_number
-        ),
-        "article": (
-            " + ".join(articles)
-            if articles
-            else "-"
-        ),
-        "name": (
-            " + ".join(names)
-            if names
-            else "-"
-        ),
-        "qty": str(
-            total_qty
-        ),
-        "raw": posting
+
+        "posting_number":
+            str(posting_number),
+
+        "article":
+            " + ".join(
+                articles
+            ) or "-",
+
+        "product":
+            " + ".join(
+                names
+            ) or "-",
+
+        "quantity":
+            total_quantity,
+
+        "status":
+            posting.get(
+                "status",
+                ""
+            ),
+
+        "raw":
+            posting
     }
 
 
 # ============================================================
-# ДОБАВЛЕНИЕ В MAP
+# 3. ПОЛУЧАЕМ PDF ЭТИКЕТОК
 # ============================================================
 
-def add_postings_to_mapping(
-    postings,
-    api_mapping
-):
-
-    for posting in postings:
-
-        record = posting_to_record(
-            posting
-        )
-
-        shipment = record[
-            "shipment"
-        ]
-
-        if not shipment:
-            continue
-
-        normalized = normalize_shipment(
-            shipment
-        )
-
-        if not normalized:
-            continue
-
-        api_mapping[
-            normalized
-        ] = record
-
-        compact = compact_shipment(
-            normalized
-        )
-
-        if compact:
-
-            api_mapping[
-                f"__compact__{compact}"
-            ] = record
-
-
-# ============================================================
-# API КУСКАМИ
-# ============================================================
-
-def get_assembly_data_chunked(
+def get_labels_for_postings(
     client_id,
     api_key,
-    days_back=180,
-    days_forward=7,
-    chunk_days=30
+    posting_numbers,
+    progress_callback=None
 ):
 
-    api_mapping = {}
+    headers = api_headers(
+        client_id,
+        api_key
+    )
 
-    now = datetime.utcnow()
+    all_label_pages = []
 
-    start = (
-        now -
-        timedelta(
-            days=days_back
+    label_records = []
+
+    batches = list(
+        chunks(
+            posting_numbers,
+            20
         )
     )
 
-    finish = (
-        now +
-        timedelta(
-            days=days_forward
-        )
+    total_batches = len(
+        batches
     )
 
-    current = start
+    for batch_index, batch in enumerate(
+        batches,
+        start=1
+    ):
 
-    chunks = max(
-        1,
-        int(
-            (
-                finish - start
-            ).total_seconds()
-            /
-            (
-                chunk_days *
-                86400
+        # ----------------------------------------------------
+        # Сначала пытаемся получить пачку из 20
+        # ----------------------------------------------------
+
+        payload = {
+            "posting_number": batch
+        }
+
+        response = requests.post(
+            LABEL_URL,
+            headers={
+                **headers,
+                "Accept": "application/pdf"
+            },
+            json=payload,
+            timeout=120
+        )
+
+        if response.status_code == 200:
+
+            pdf_bytes = response.content
+
+            reader = PdfReader(
+                io.BytesIO(
+                    pdf_bytes
+                )
             )
-        ) + 1
-    )
 
-    progress = st.progress(
-        0,
-        text="Получение данных API..."
-    )
-
-    request_number = 0
-    total_postings = 0
-
-    while current < finish:
-
-        chunk_end = min(
-            current +
-            timedelta(
-                days=chunk_days
-            ),
-            finish
-        )
-
-        date_from = current.strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-
-        date_to = chunk_end.strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-
-        request_number += 1
-
-        postings = api_request(
-            client_id,
-            api_key,
-            date_from,
-            date_to
-        )
-
-        total_postings += len(
-            postings
-        )
-
-        add_postings_to_mapping(
-            postings,
-            api_mapping
-        )
-
-        progress.progress(
-            min(
-                request_number / chunks,
-                1
-            ),
-            text=(
-                f"Запрос {request_number}: "
-                f"{date_from[:10]} → "
-                f"{date_to[:10]} | "
-                f"получено {len(postings)}"
+            pages_count = len(
+                reader.pages
             )
-        )
 
-        current = chunk_end
+            # ------------------------------------------------
+            # Нормальный случай:
+            # количество страниц = количество отправлений
+            # ------------------------------------------------
 
-    progress.progress(
-        1,
-        text="API завершено"
-    )
+            if pages_count == len(batch):
 
-    return (
-        api_mapping,
-        total_postings,
-        request_number
-    )
+                for i, page in enumerate(
+                    reader.pages
+                ):
+
+                    label_records.append({
+                        "posting_number":
+                            batch[i],
+
+                        "page":
+                            page,
+
+                        "source":
+                            "batch"
+                    })
+
+            else:
+
+                # ------------------------------------------------
+                # Если количество страниц не совпало,
+                # безопаснее получить этикетки по одной.
+                # ------------------------------------------------
+
+                for posting_number in batch:
+
+                    single_result = (
+                        get_single_label(
+                            client_id,
+                            api_key,
+                            posting_number
+                        )
+                    )
+
+                    if single_result:
+
+                        label_records.append({
+                            "posting_number":
+                                posting_number,
+
+                            "page":
+                                single_result,
+
+                            "source":
+                                "single"
+                        })
+
+        else:
+
+            # ------------------------------------------------
+            # Если вся пачка не прошла,
+            # пробуем каждое отправление отдельно.
+            # ------------------------------------------------
+
+            for posting_number in batch:
+
+                single_result = (
+                    get_single_label(
+                        client_id,
+                        api_key,
+                        posting_number
+                    )
+                )
+
+                if single_result:
+
+                    label_records.append({
+                        "posting_number":
+                            posting_number,
+
+                        "page":
+                            single_result,
+
+                        "source":
+                            "single"
+                    })
+
+        if progress_callback:
+
+            progress_callback(
+                batch_index /
+                total_batches,
+                (
+                    f"Этикетки: пачка "
+                    f"{batch_index} из "
+                    f"{total_batches}"
+                )
+            )
+
+    return label_records
 
 
 # ============================================================
-# ПОИСК API
+# ПОЛУЧИТЬ ОДНУ ЭТИКЕТКУ
 # ============================================================
 
-def find_api_posting(
-    shipment,
-    api_mapping
+def get_single_label(
+    client_id,
+    api_key,
+    posting_number
 ):
 
-    if not shipment:
-        return None
-
-    normalized = normalize_shipment(
-        shipment
+    headers = api_headers(
+        client_id,
+        api_key
     )
 
-    if normalized in api_mapping:
-        return api_mapping[
-            normalized
+    payload = {
+        "posting_number": [
+            posting_number
         ]
+    }
 
-    compact = compact_shipment(
-        normalized
-    )
+    # --------------------------------------------------------
+    # Иногда Ozon ещё не успел сформировать этикетку.
+    # Пробуем несколько раз.
+    # --------------------------------------------------------
 
-    if compact:
+    max_attempts = 3
 
-        key = (
-            "__compact__"
-            + compact
+    for attempt in range(
+        1,
+        max_attempts + 1
+    ):
+
+        response = requests.post(
+            LABEL_URL,
+            headers={
+                **headers,
+                "Accept": "application/pdf"
+            },
+            json=payload,
+            timeout=60
         )
 
-        if key in api_mapping:
-            return api_mapping[
-                key
-            ]
+        if response.status_code == 200:
+
+            try:
+
+                reader = PdfReader(
+                    io.BytesIO(
+                        response.content
+                    )
+                )
+
+                if len(
+                    reader.pages
+                ) > 0:
+
+                    return reader.pages[0]
+
+            except Exception:
+
+                return None
+
+        # ----------------------------------------------------
+        # Этикетка может быть ещё не готова.
+        # ----------------------------------------------------
+
+        if attempt < max_attempts:
+
+            time.sleep(2)
 
     return None
 
 
 # ============================================================
-# TEXT WRAP
+# 4. СОЗДАЁМ ИНФОРМАЦИОННУЮ СТРАНИЦУ
 # ============================================================
 
-def split_text(
-    text,
-    chars=45
-):
-
-    if not text:
-        return ["-"]
-
-    text = str(text)
-
-    result = []
-
-    while len(text) > chars:
-
-        pos = text.rfind(
-            " ",
-            0,
-            chars
-        )
-
-        if pos <= 0:
-            pos = chars
-
-        result.append(
-            text[:pos]
-        )
-
-        text = text[
-            pos:
-        ].strip()
-
-    if text:
-        result.append(
-            text
-        )
-
-    return result
-
-
-# ============================================================
-# INFO PDF
-# ============================================================
-
-def create_info_label(
+def create_info_page(
     width,
     height,
-    order_number,
-    product_info,
-    status="OK"
+    posting
 ):
 
     buffer = io.BytesIO()
@@ -785,12 +605,9 @@ def create_info_label(
         )
     )
 
-    title = (
-        "ИНФОРМАЦИЯ ОТПРАВЛЕНИЯ"
-        if status == "OK"
-        else
-        "ОТПРАВЛЕНИЕ НЕ НАЙДЕНО"
-    )
+    # --------------------------------------------------------
+    # Заголовок
+    # --------------------------------------------------------
 
     c.setFont(
         FONT_BOLD,
@@ -800,166 +617,113 @@ def create_info_label(
     c.drawCentredString(
         width / 2,
         height - 40,
-        title
+        "ИНФОРМАЦИЯ ОТПРАВЛЕНИЯ"
     )
 
     y = height - 85
 
-    c.setFont(
-        FONT_BOLD,
-        10
-    )
+    # --------------------------------------------------------
+    # Отправление
+    # --------------------------------------------------------
 
-    c.drawString(
-        30,
-        y,
-        "Отправление:"
-    )
+    fields = [
 
-    c.setFont(
-        FONT_REGULAR,
-        10
-    )
-
-    c.drawString(
-        125,
-        y,
-        str(
-            order_number or "—"
-        )
-    )
-
-    y -= 30
-
-    c.setFont(
-        FONT_BOLD,
-        10
-    )
-
-    c.drawString(
-        30,
-        y,
-        "Статус:"
-    )
-
-    c.setFont(
-        FONT_REGULAR,
-        10
-    )
-
-    c.drawString(
-        125,
-        y,
         (
-            "Найдено в Ozon API"
-            if status == "OK"
-            else
-            "Не найдено в Ozon API"
-        )
-    )
-
-    y -= 35
-
-    # Артикул
-    c.setFont(
-        FONT_BOLD,
-        10
-    )
-
-    c.drawString(
-        30,
-        y,
-        "Артикул:"
-    )
-
-    y -= 16
-
-    c.setFont(
-        FONT_REGULAR,
-        9
-    )
-
-    for line in split_text(
-        product_info.get(
-            "article",
-            "-"
+            "Отправление",
+            posting[
+                "posting_number"
+            ]
         ),
-        55
-    ):
+
+        (
+            "Артикул",
+            posting[
+                "article"
+            ]
+        ),
+
+        (
+            "Товар",
+            posting[
+                "product"
+            ]
+        ),
+
+        (
+            "Количество",
+            posting[
+                "quantity"
+            ]
+        ),
+
+        (
+            "Статус",
+            posting[
+                "status"
+            ]
+        )
+    ]
+
+    for label, value in fields:
+
+        c.setFont(
+            FONT_BOLD,
+            10
+        )
 
         c.drawString(
             30,
             y,
-            line
+            f"{label}:"
         )
 
-        y -= 14
+        y -= 16
 
-    y -= 8
-
-    # Товар
-    c.setFont(
-        FONT_BOLD,
-        10
-    )
-
-    c.drawString(
-        30,
-        y,
-        "Товар:"
-    )
-
-    y -= 16
-
-    c.setFont(
-        FONT_REGULAR,
-        9
-    )
-
-    for line in split_text(
-        product_info.get(
-            "name",
-            "-"
-        ),
-        55
-    ):
-
-        c.drawString(
-            30,
-            y,
-            line
+        c.setFont(
+            FONT_REGULAR,
+            9
         )
 
-        y -= 14
+        text = str(
+            value
+        )
 
-    y -= 8
+        # Разбиваем длинный текст
+        # примерно по 60 символов
 
-    c.setFont(
-        FONT_BOLD,
-        10
-    )
+        while len(text) > 60:
 
-    c.drawString(
-        30,
-        y,
-        "Количество:"
-    )
+            part = text[:60]
 
-    c.setFont(
-        FONT_REGULAR,
-        10
-    )
+            # Ищем последний пробел
+            pos = part.rfind(" ")
 
-    c.drawString(
-        125,
-        y,
-        str(
-            product_info.get(
-                "qty",
-                "-"
+            if pos > 0:
+                part = text[:pos]
+
+            c.drawString(
+                30,
+                y,
+                part
             )
-        )
-    )
+
+            y -= 13
+
+            text = text[
+                len(part):
+            ].strip()
+
+        if text:
+
+            c.drawString(
+                30,
+                y,
+                text
+            )
+
+            y -= 13
+
+        y -= 10
 
     c.showPage()
     c.save()
@@ -970,68 +734,39 @@ def create_info_label(
 
 
 # ============================================================
-# СОЗДАНИЕ PDF
+# 5. ФОРМИРУЕМ ИТОГОВЫЙ PDF
 # ============================================================
 
-def create_final_pdf(
-    uploaded_file,
-    api_mapping,
-    label_records
+def create_result_pdf(
+    label_records,
+    postings_map
 ):
-
-    reader = PdfReader(
-        uploaded_file
-    )
 
     writer = PdfWriter()
 
-    diagnostics = []
+    mapping_rows = []
 
-    found = 0
-    not_found = 0
+    for index, label in enumerate(
+        label_records,
+        start=1
+    ):
 
-    for record in label_records:
+        posting_number = (
+            label[
+                "posting_number"
+            ]
+        )
 
-        page_number = record[
+        posting = postings_map.get(
+            posting_number
+        )
+
+        if not posting:
+            continue
+
+        page = label[
             "page"
         ]
-
-        page = reader.pages[
-            page_number - 1
-        ]
-
-        shipment = record[
-            "shipment"
-        ]
-
-        api_record = find_api_posting(
-            shipment,
-            api_mapping
-        )
-
-        if api_record:
-
-            found += 1
-
-            status = "OK"
-
-            info = api_record
-
-        else:
-
-            not_found += 1
-
-            status = "НЕ НАЙДЕНО"
-
-            info = {
-                "article": "-",
-                "name": "-",
-                "qty": "-"
-            }
-
-        writer.add_page(
-            page
-        )
 
         width = float(
             page.mediabox.width
@@ -1041,12 +776,22 @@ def create_final_pdf(
             page.mediabox.height
         )
 
-        info_pdf = create_info_label(
+        # ----------------------------------------------------
+        # Оригинальная этикетка
+        # ----------------------------------------------------
+
+        writer.add_page(
+            page
+        )
+
+        # ----------------------------------------------------
+        # Информация
+        # ----------------------------------------------------
+
+        info_pdf = create_info_page(
             width,
             height,
-            shipment or "—",
-            info,
-            status
+            posting
         )
 
         info_reader = PdfReader(
@@ -1057,43 +802,50 @@ def create_final_pdf(
             info_reader.pages[0]
         )
 
-        diagnostics.append({
-            "Страница": page_number,
-            "Отправление": (
-                shipment
-                or "НЕ РАСПОЗНАНО"
-            ),
-            "Кандидаты": " | ".join(
-                record.get(
-                    "candidates",
-                    []
-                )
-            ),
-            "Артикул": (
-                info.get(
-                    "article",
-                    "-"
-                )
-                if api_record
-                else "-"
-            ),
-            "Товар": (
-                info.get(
-                    "name",
-                    "-"
-                )
-                if api_record
-                else "-"
-            ),
-            "Кол-во": (
-                info.get(
-                    "qty",
-                    "-"
-                )
-                if api_record
-                else "-"
-            ),
-            "API": status
+        # ----------------------------------------------------
+        # Маппинг
+        # ----------------------------------------------------
+
+        mapping_rows.append({
+
+            "№":
+                index,
+
+            "Страница PDF":
+                index,
+
+            "Отправление":
+                posting[
+                    "posting_number"
+                ],
+
+            "Артикул":
+                posting[
+                    "article"
+                ],
+
+            "Товар":
+                posting[
+                    "product"
+                ],
+
+            "Кол-во":
+                posting[
+                    "quantity"
+                ],
+
+            "Статус":
+                posting[
+                    "status"
+                ],
+
+            "Этикетка":
+                "✅",
+
+            "Источник":
+                label[
+                    "source"
+                ]
         })
 
     output = io.BytesIO()
@@ -1106,23 +858,24 @@ def create_final_pdf(
 
     return (
         output,
-        diagnostics,
-        found,
-        not_found
+        mapping_rows
     )
 
 
 # ============================================================
-# ИНТЕРФЕЙС
+# INTERFACE
 # ============================================================
 
 st.title(
-    "🖨️ Ozon FBS — Этикетки + API"
+    "🏷️ Ozon FBS — Отправления → Этикетки → Маппинг"
 )
 
-st.write(
-    "Распознавание номера отправления "
-    "из PDF + поиск отправления через Ozon API."
+st.markdown(
+    """
+    **Скрипт полностью работает через Ozon API.**
+
+    PDF этикеток загружать вручную не нужно.
+    """
 )
 
 
@@ -1144,411 +897,498 @@ api_key = st.sidebar.text_input(
     type="password"
 )
 
+
 st.sidebar.markdown(
     "---"
 )
 
-days_back = st.sidebar.number_input(
-    "Дней назад",
-    min_value=30,
-    max_value=365,
-    value=180,
-    step=30
+st.sidebar.subheader(
+    "📅 Период"
 )
 
-days_forward = st.sidebar.number_input(
-    "Дней вперёд",
-    min_value=0,
-    max_value=60,
-    value=7,
-    step=7
+default_to = datetime.now()
+
+default_from = (
+    default_to -
+    timedelta(days=7)
+)
+
+date_from = st.sidebar.date_input(
+    "От",
+    value=default_from.date()
+)
+
+date_to = st.sidebar.date_input(
+    "До",
+    value=default_to.date()
 )
 
 
 # ============================================================
-# PDF
+# КНОПКА
 # ============================================================
 
-uploaded_file = st.file_uploader(
-    "📄 Загрузите PDF этикеток",
-    type=["pdf"]
+run = st.button(
+    "🚀 Получить отправления и этикетки",
+    type="primary",
+    use_container_width=True
 )
 
 
-if uploaded_file:
+if run:
 
-    try:
-
-        reader = PdfReader(
-            uploaded_file
-        )
-
-    except Exception as e:
+    if not client_id:
 
         st.error(
-            f"Ошибка открытия PDF: {e}"
+            "Введите Client-Id."
         )
 
         st.stop()
 
-    total_pages = len(
-        reader.pages
+    if not api_key:
+
+        st.error(
+            "Введите Api-Key."
+        )
+
+        st.stop()
+
+
+    # ========================================================
+    # ДАТЫ
+    # ========================================================
+
+    date_from_str = (
+        datetime.combine(
+            date_from,
+            datetime.min.time()
+        ).strftime(
+            "%Y-%m-%dT00:00:00Z"
+        )
     )
 
-    st.info(
-        f"Страниц в PDF: **{total_pages}**"
+    date_to_str = (
+        datetime.combine(
+            date_to,
+            datetime.max.time()
+        ).strftime(
+            "%Y-%m-%dT23:59:59Z"
+        )
     )
 
 
     # ========================================================
-    # РАСПОЗНАВАНИЕ
+    # ЭТАП 1
     # ========================================================
 
-    st.subheader(
-        "1️⃣ Распознавание этикеток"
+    st.header(
+        "1️⃣ Получение отправлений"
     )
 
-    label_records = []
-
-    progress = st.progress(
-        0
-    )
-
-    for page_number, page in enumerate(
-        reader.pages,
-        start=1
+    with st.spinner(
+        "Запрашиваем отправления Ozon..."
     ):
 
-        shipment, raw_text, candidates = (
-            extract_shipment_from_label(
-                page
+        try:
+
+            raw_postings = get_postings(
+                client_id,
+                api_key,
+                date_from_str,
+                date_to_str
             )
+
+        except Exception as e:
+
+            st.error(
+                str(e)
+            )
+
+            st.stop()
+
+
+    postings = []
+
+    for raw in raw_postings:
+
+        posting = convert_posting(
+            raw
         )
 
-        label_records.append({
-            "page": page_number,
-            "shipment": shipment,
-            "raw_text": raw_text,
-            "candidates": candidates
-        })
+        if posting[
+            "posting_number"
+        ]:
+
+            postings.append(
+                posting
+            )
+
+
+    postings_map = {
+
+        x[
+            "posting_number"
+        ]:
+        x
+
+        for x in postings
+    }
+
+
+    st.success(
+        f"Получено отправлений: "
+        f"**{len(postings)}**"
+    )
+
+
+    # ========================================================
+    # ТАБЛИЦА ОТПРАВЛЕНИЙ
+    # ========================================================
+
+    with st.expander(
+        "📦 Показать отправления"
+    ):
+
+        postings_table = [
+
+            {
+                "№": i,
+                "Отправление":
+                    x[
+                        "posting_number"
+                    ],
+                "Артикул":
+                    x[
+                        "article"
+                    ],
+                "Товар":
+                    x[
+                        "product"
+                    ],
+                "Кол-во":
+                    x[
+                        "quantity"
+                    ],
+                "Статус":
+                    x[
+                        "status"
+                    ]
+            }
+
+            for i, x in enumerate(
+                postings,
+                start=1
+            )
+        ]
+
+        st.dataframe(
+            postings_table,
+            use_container_width=True,
+            hide_index=True
+        )
+
+
+    if not postings:
+
+        st.warning(
+            "Отправлений за выбранный период нет."
+        )
+
+        st.stop()
+
+
+    # ========================================================
+    # ЭТАП 2
+    # ========================================================
+
+    st.header(
+        "2️⃣ Получение этикеток"
+    )
+
+    posting_numbers = [
+
+        x[
+            "posting_number"
+        ]
+
+        for x in postings
+    ]
+
+
+    progress = st.progress(
+        0,
+        text="Запрашиваем этикетки..."
+    )
+
+
+    def update_progress(
+        value,
+        text
+    ):
 
         progress.progress(
-            page_number / total_pages,
-            text=(
-                f"Этикетка "
-                f"{page_number} из "
-                f"{total_pages}"
+            value,
+            text=text
+        )
+
+
+    with st.spinner(
+        "Получаем PDF этикеток Ozon..."
+    ):
+
+        label_records = (
+            get_labels_for_postings(
+                client_id,
+                api_key,
+                posting_numbers,
+                update_progress
             )
         )
 
-    recognized = sum(
-        1
-        for x in label_records
-        if x["shipment"]
+
+    progress.progress(
+        1,
+        text="Получение этикеток завершено"
     )
 
-    not_recognized = (
-        total_pages - recognized
+
+    # ========================================================
+    # СТАТИСТИКА
+    # ========================================================
+
+    labels_count = len(
+        label_records
     )
+
+    missing_count = (
+        len(postings)
+        -
+        labels_count
+    )
+
 
     c1, c2, c3 = st.columns(3)
 
     c1.metric(
-        "Этикеток",
-        total_pages
+        "Отправлений",
+        len(postings)
     )
 
     c2.metric(
-        "Номер распознан",
-        recognized
+        "Этикеток получено",
+        labels_count
     )
 
     c3.metric(
-        "Не распознан",
-        not_recognized
+        "Без этикетки",
+        max(
+            missing_count,
+            0
+        )
     )
 
 
     # ========================================================
-    # ДИАГНОСТИКА PDF
+    # ЭТАП 3
     # ========================================================
 
-    if not_recognized > 0:
+    st.header(
+        "3️⃣ Таблица маппинга"
+    )
 
-        st.error(
-            f"❌ Не удалось определить "
-            f"номер на {not_recognized} "
-            f"этикетках."
+
+    label_postings = {
+
+        x[
+            "posting_number"
+        ]
+
+        for x in label_records
+    }
+
+
+    mapping_preview = []
+
+    for index, posting in enumerate(
+        postings,
+        start=1
+    ):
+
+        posting_number = (
+            posting[
+                "posting_number"
+            ]
         )
 
-        with st.expander(
-            "🔍 Показать текст первых 5 нераспознанных этикеток"
-        ):
+        has_label = (
+            posting_number
+            in
+            label_postings
+        )
 
-            shown = 0
+        mapping_preview.append({
 
-            for record in label_records:
+            "№":
+                index,
 
-                if record["shipment"]:
-                    continue
+            "Отправление":
+                posting_number,
 
-                st.markdown(
-                    f"### Страница {record['page']}"
-                )
+            "Артикул":
+                posting[
+                    "article"
+                ],
 
-                text_preview = record[
-                    "raw_text"
-                ]
+            "Товар":
+                posting[
+                    "product"
+                ],
 
-                if not text_preview:
-                    text_preview = (
-                        "[PDF не содержит извлекаемого текста]"
-                    )
+            "Кол-во":
+                posting[
+                    "quantity"
+                ],
 
-                st.code(
-                    text_preview[:5000]
-                )
+            "Статус":
+                posting[
+                    "status"
+                ],
 
-                shown += 1
+            "Этикетка":
+                "✅"
+                if has_label
+                else
+                "❌"
+        })
 
-                if shown >= 5:
-                    break
 
-
-        with st.expander(
-            "🔍 Показать найденные кандидаты"
-        ):
-
-            candidate_rows = []
-
-            for record in label_records:
-
-                candidate_rows.append({
-                    "Страница": record[
-                        "page"
-                    ],
-                    "Номер": record[
-                        "shipment"
-                    ] or "—",
-                    "Кандидаты": " | ".join(
-                        record[
-                            "candidates"
-                        ]
-                    ) or "—"
-                })
-
-            st.dataframe(
-                candidate_rows,
-                use_container_width=True,
-                hide_index=True
-            )
+    st.dataframe(
+        mapping_preview,
+        use_container_width=True,
+        hide_index=True
+    )
 
 
     # ========================================================
-    # API
+    # НЕПОЛУЧЕННЫЕ ЭТИКЕТКИ
     # ========================================================
 
-    if not client_id or not api_key:
+    missing_labels = [
+
+        x
+
+        for x in postings
+
+        if x[
+            "posting_number"
+        ]
+        not in label_postings
+    ]
+
+
+    if missing_labels:
 
         st.warning(
-            "Введите Client-Id и Api-Key."
+            f"Не удалось получить "
+            f"этикетки для "
+            f"{len(missing_labels)} "
+            f"отправлений."
         )
 
-        st.stop()
+        st.dataframe(
+            [
+                {
+                    "Отправление":
+                        x[
+                            "posting_number"
+                        ],
+
+                    "Артикул":
+                        x[
+                            "article"
+                        ],
+
+                    "Товар":
+                        x[
+                            "product"
+                        ],
+
+                    "Статус":
+                        x[
+                            "status"
+                        ]
+                }
+
+                for x in missing_labels
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
 
 
-    st.subheader(
-        "2️⃣ Получение данных Ozon API"
-    )
+    # ========================================================
+    # ЭТАП 4
+    # ========================================================
 
-    start = st.button(
-        "🚀 Получить API и собрать PDF",
-        type="primary",
-        use_container_width=True
-    )
+    if label_records:
 
-
-    if start:
+        st.header(
+            "4️⃣ Формирование итогового PDF"
+        )
 
         try:
 
-            # ------------------------------------------------
-            # API
-            # ------------------------------------------------
-
-            api_mapping, total_postings, requests_count = (
-                get_assembly_data_chunked(
-                    client_id,
-                    api_key,
-                    int(days_back),
-                    int(days_forward),
-                    30
+            final_pdf, mapping_rows = (
+                create_result_pdf(
+                    label_records,
+                    postings_map
                 )
             )
-
-            unique_postings = len([
-                key
-                for key in api_mapping
-                if not key.startswith(
-                    "__compact__"
-                )
-            ])
 
             st.success(
-                f"Получено API: "
-                f"**{total_postings}** записей. "
-                f"Уникальных отправлений: "
-                f"**{unique_postings}**."
+                f"Итоговый PDF готов. "
+                f"Этикеток внутри: "
+                f"**{len(mapping_rows)}**."
             )
 
 
             # ------------------------------------------------
-            # Сопоставление
-            # ------------------------------------------------
-
-            st.subheader(
-                "3️⃣ Сопоставление"
-            )
-
-            preliminary_found = 0
-
-            preliminary_not_found = 0
-
-            for record in label_records:
-
-                shipment = record[
-                    "shipment"
-                ]
-
-                if not shipment:
-
-                    preliminary_not_found += 1
-                    continue
-
-                result = find_api_posting(
-                    shipment,
-                    api_mapping
-                )
-
-                if result:
-                    preliminary_found += 1
-                else:
-                    preliminary_not_found += 1
-
-
-            c1, c2, c3 = st.columns(3)
-
-            c1.metric(
-                "Этикеток",
-                total_pages
-            )
-
-            c2.metric(
-                "Найдено в API",
-                preliminary_found
-            )
-
-            c3.metric(
-                "Не найдено",
-                preliminary_not_found
-            )
-
-
-            # ------------------------------------------------
-            # PDF
-            # ------------------------------------------------
-
-            final_pdf, diagnostics, found, not_found = (
-                create_final_pdf(
-                    uploaded_file,
-                    api_mapping,
-                    label_records
-                )
-            )
-
-
-            # ------------------------------------------------
-            # ИТОГ
-            # ------------------------------------------------
-
-            st.subheader(
-                "4️⃣ Итог"
-            )
-
-            c1, c2, c3 = st.columns(3)
-
-            c1.metric(
-                "Всего этикеток",
-                total_pages
-            )
-
-            c2.metric(
-                "Найдено",
-                found
-            )
-
-            c3.metric(
-                "Не найдено",
-                not_found
-            )
-
-
-            # ------------------------------------------------
-            # НЕ НАЙДЕННЫЕ
-            # ------------------------------------------------
-
-            missing = [
-                x
-                for x in diagnostics
-                if x["API"] != "OK"
-            ]
-
-            if missing:
-
-                st.warning(
-                    f"Осталось не найдено: "
-                    f"**{len(missing)}**"
-                )
-
-                st.dataframe(
-                    missing,
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-            else:
-
-                st.success(
-                    "🎉 Все этикетки "
-                    "сопоставлены с API."
-                )
-
-
-            # ------------------------------------------------
-            # ВСЕ
+            # ФИНАЛЬНАЯ ТАБЛИЦА
             # ------------------------------------------------
 
             with st.expander(
-                "📋 Все сопоставления"
+                "📋 Финальный маппинг PDF"
             ):
 
                 st.dataframe(
-                    diagnostics,
+                    mapping_rows,
                     use_container_width=True,
                     hide_index=True
                 )
 
 
             # ------------------------------------------------
-            # СКАЧИВАНИЕ
+            # DOWNLOAD
             # ------------------------------------------------
 
             st.download_button(
-                "⬇️ Скачать Ready_Labels.pdf",
-                data=final_pdf.getvalue(),
-                file_name="Ready_Labels.pdf",
+                label=(
+                    "⬇️ Скачать "
+                    "Ozon_FBS_Labels_Mapped.pdf"
+                ),
+
+                data=(
+                    final_pdf.getvalue()
+                ),
+
+                file_name=(
+                    "Ozon_FBS_Labels_Mapped.pdf"
+                ),
+
                 mime="application/pdf",
+
                 type="primary",
+
                 use_container_width=True
             )
 
@@ -1556,7 +1396,14 @@ if uploaded_file:
         except Exception as e:
 
             st.error(
-                "❌ Ошибка:"
+                "Ошибка формирования PDF:"
             )
 
             st.exception(e)
+
+    else:
+
+        st.error(
+            "Ozon не вернул ни одной этикетки."
+        )
+        

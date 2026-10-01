@@ -1,4 +1,3 @@
-```python
 import io
 import re
 import os
@@ -1896,4 +1895,4 @@ if st.button(
         mime="application/pdf",
         use_container_width=True
     )
-```
+    

@@ -99,7 +99,7 @@ def normalize_shipment(value):
 
 
 # ============================================================
-# ПОЛУЧАЕМ ГОРИЗОНТАЛЬНЫЕ ЛИНИИ
+# ГОРИЗОНТАЛЬНЫЕ ЛИНИИ (ОБНОВЛЕНО)
 # ============================================================
 
 def get_horizontal_lines(page):
@@ -109,26 +109,16 @@ def get_horizontal_lines(page):
     page_width = float(page.width)
 
     # --------------------------------------------------------
-    # Обычные линии PDF
+    # 1. Обычные линии PDF
     # --------------------------------------------------------
 
     for line in page.lines:
 
-        x0 = float(
-            line.get("x0", 0)
-        )
+        x0 = float(line.get("x0", 0))
+        x1 = float(line.get("x1", 0))
 
-        x1 = float(
-            line.get("x1", 0)
-        )
-
-        y0 = float(
-            line.get("y0", 0)
-        )
-
-        y1 = float(
-            line.get("y1", 0)
-        )
+        y0 = float(line.get("y0", 0))
+        y1 = float(line.get("y1", 0))
 
         # Только горизонтальные
         if abs(y0 - y1) > 1:
@@ -136,51 +126,51 @@ def get_horizontal_lines(page):
 
         width = abs(x1 - x0)
 
-        # НЕ 70%.
-        # У Ozon линия может быть короче ширины страницы.
-        if width < page_width * 0.40:
+        # Для вашего Ozon PDF достаточно 30%
+        if width < page_width * 0.30:
             continue
 
-        top = float(page.height) - y0
+        # !!! ВАЖНО !!!
+        # Используем готовую координату pdfplumber
+        if "top" in line:
+            top = float(line["top"])
+        else:
+            top = float(page.height) - y0
 
         result.append(top)
 
 
     # --------------------------------------------------------
-    # Иногда PDF хранит линии как rects
+    # 2. Иногда Ozon хранит разделители как rect
     # --------------------------------------------------------
 
     for rect in page.rects:
 
-        x0 = float(
-            rect.get("x0", 0)
-        )
+        x0 = float(rect.get("x0", 0))
+        x1 = float(rect.get("x1", 0))
 
-        x1 = float(
-            rect.get("x1", 0)
-        )
-
-        y0 = float(
-            rect.get("y0", 0)
-        )
-
-        y1 = float(
-            rect.get("y1", 0)
-        )
+        y0 = float(rect.get("y0", 0))
+        y1 = float(rect.get("y1", 0))
 
         width = abs(x1 - x0)
         height = abs(y1 - y0)
 
-        # Очень тонкий горизонтальный прямоугольник
-        if height <= 2 and width >= page_width * 0.40:
+        if (
+            height <= 2
+            and
+            width >= page_width * 0.30
+        ):
 
-            top = float(page.height) - y0
+            if "top" in rect:
+                top = float(rect["top"])
+            else:
+                top = float(page.height) - y0
 
             result.append(top)
 
 
     # --------------------------------------------------------
-    # Удаляем дубли
+    # Убираем дубликаты
     # --------------------------------------------------------
 
     result.sort()
@@ -190,10 +180,11 @@ def get_horizontal_lines(page):
     for y in result:
 
         if not unique:
-
             unique.append(y)
 
-        elif abs(y - unique[-1]) > 2:
+        elif abs(
+            y - unique[-1]
+        ) > 2:
 
             unique.append(y)
 
@@ -202,7 +193,7 @@ def get_horizontal_lines(page):
 
 
 # ============================================================
-# ТЕКСТ МЕЖДУ ГОРИЗОНТАЛЬНЫМИ ЛИНИЯМИ
+# ТЕКСТ МЕЖДУ ГОРИЗОНТАЛЬНЫМИ ЛИНИЯМИ (ОБНОВЛЕНО)
 # ============================================================
 
 def get_text_between_lines(
@@ -214,6 +205,11 @@ def get_text_between_lines(
 
     row_words = []
 
+    # --------------------------------------------------------
+    # Берём слово по ЦЕНТРУ, а не требуем целиком попасть
+    # между линиями.
+    # --------------------------------------------------------
+
     for word in words:
 
         word_top = float(
@@ -224,11 +220,16 @@ def get_text_between_lines(
             word["bottom"]
         )
 
-        # С небольшим запасом
+        word_center = (
+            word_top +
+            word_bottom
+        ) / 2
+
+
         if (
-            word_top >= top + 1
+            word_center > top + 2
             and
-            word_bottom <= bottom + 1
+            word_center < bottom - 2
         ):
 
             row_words.append(
@@ -241,14 +242,13 @@ def get_text_between_lines(
 
 
     # --------------------------------------------------------
-    # Очень важно:
-    # сохраняем расположение текста по вертикали.
+    # Сначала сортируем по вертикали
     # --------------------------------------------------------
 
     row_words.sort(
-        key=lambda x: (
-            round(float(x["top"]), 1),
-            float(x["x0"])
+        key=lambda w: (
+            float(w["top"]),
+            float(w["x0"])
         )
     )
 
@@ -269,7 +269,9 @@ def get_text_between_lines(
         if (
             current_y is None
             or
-            abs(y - current_y) <= 3
+            abs(
+                y - current_y
+            ) <= 3
         ):
 
             current_line.append(
@@ -278,24 +280,23 @@ def get_text_between_lines(
 
         else:
 
-            if current_line:
-
-                current_line.sort(
-                    key=lambda x: float(
-                        x["x0"]
-                    )
+            current_line.sort(
+                key=lambda w: float(
+                    w["x0"]
                 )
+            )
 
-                lines.append(
-                    " ".join(
-                        x["text"]
-                        for x in current_line
-                    )
+            lines.append(
+                " ".join(
+                    w["text"]
+                    for w in current_line
                 )
+            )
 
             current_line = [
                 word
             ]
+
 
         current_y = y
 
@@ -303,15 +304,15 @@ def get_text_between_lines(
     if current_line:
 
         current_line.sort(
-            key=lambda x: float(
-                x["x0"]
+            key=lambda w: float(
+                w["x0"]
             )
         )
 
         lines.append(
             " ".join(
-                x["text"]
-                for x in current_line
+                w["text"]
+                for w in current_line
             )
         )
 
@@ -387,7 +388,6 @@ def parse_product_tail(text):
     if not text:
         return None
 
-
     tokens = text.split()
 
     if len(tokens) < 3:
@@ -427,14 +427,7 @@ def parse_product_tail(text):
 
         # ----------------------------------------------------
         # Редкий случай:
-        #
-        # PDF склеил:
-        #
-        # 1 8886
-        #
-        # в:
-        #
-        # 18886
+        # PDF склеил: 1 8886 в: 18886
         # ----------------------------------------------------
 
         for i in range(
@@ -564,13 +557,9 @@ def parse_product_tail(text):
 
 
     return {
-
         "article": article,
-
         "qty": qty,
-
         "label": label,
-
         "name": name
     }
 
@@ -657,21 +646,16 @@ def parse_row(text):
 
 
     return {
-
         "shipment": shipment,
-
         "label": product["label"],
-
         "name": product["name"],
-
         "article": product["article"],
-
         "qty": product["qty"]
     }
 
 
 # ============================================================
-# ОСНОВНОЙ ПАРСЕР
+# ОСНОВНОЙ ПАРСЕР ЛИСТА ПОДБОРА (ОБНОВЛЕНО)
 # ============================================================
 
 @st.cache_data(show_spinner=False)
@@ -682,13 +666,8 @@ def parse_assembly_list(pdf_bytes):
     diagnostics = []
 
 
-    pdf_stream = BytesIO(
-        pdf_bytes
-    )
-
-
     with pdfplumber.open(
-        pdf_stream
+        BytesIO(pdf_bytes)
     ) as pdf:
 
 
@@ -704,7 +683,7 @@ def parse_assembly_list(pdf_bytes):
 
 
             # ==================================================
-            # Горизонтальные линии
+            # ЛИНИИ
             # ==================================================
 
             lines = get_horizontal_lines(
@@ -712,32 +691,8 @@ def parse_assembly_list(pdf_bytes):
             )
 
 
-            # --------------------------------------------------
-            # Если линий мало — диагностика
-            # --------------------------------------------------
-
-            if len(lines) < 2:
-
-                diagnostics.append({
-
-                    "Страница":
-                        page_number,
-
-                    "Горизонтальных линий":
-                        len(lines),
-
-                    "Сформировано строк":
-                        0,
-
-                    "Найдено отправлений":
-                        0
-                })
-
-                continue
-
-
             # ==================================================
-            # Слова страницы
+            # СЛОВА
             # ==================================================
 
             words = page.extract_words(
@@ -748,38 +703,47 @@ def parse_assembly_list(pdf_bytes):
 
 
             if not words:
+
+                diagnostics.append({
+                    "Страница": page_number,
+                    "Горизонтальных линий": len(lines),
+                    "Сформировано строк": 0,
+                    "Найдено отправлений": 0
+                })
+
                 continue
 
 
             # ==================================================
-            # Границы
+            # ВАЖНО:
+            #
+            # линии должны быть настоящими границами строк.
+            #
+            # Добавляем верх и низ страницы.
             # ==================================================
 
-            boundaries = []
-
-            boundaries.append(
+            boundaries = [
                 0
+            ]
+
+            boundaries.extend(
+                lines
             )
-
-
-            for y in lines:
-
-                if (
-                    not boundaries
-                    or
-                    abs(
-                        y -
-                        boundaries[-1]
-                    ) > 2
-                ):
-
-                    boundaries.append(
-                        y
-                    )
-
 
             boundaries.append(
                 float(page.height)
+            )
+
+
+            # --------------------------------------------------
+            # Убираем дубликаты
+            # --------------------------------------------------
+
+            boundaries = sorted(
+                set(
+                    round(x, 2)
+                    for x in boundaries
+                )
             )
 
 
@@ -788,7 +752,7 @@ def parse_assembly_list(pdf_bytes):
 
 
             # ==================================================
-            # Каждая область между горизонтальными линиями
+            # ИДЁМ МЕЖДУ СОСЕДНИМИ ЛИНИЯМИ
             # ==================================================
 
             for i in range(
@@ -799,7 +763,11 @@ def parse_assembly_list(pdf_bytes):
                 bottom = boundaries[i + 1]
 
 
-                if bottom - top < 20:
+                # Слишком маленький участок
+                if (
+                    bottom - top
+                    < 8
+                ):
                     continue
 
 
@@ -818,36 +786,30 @@ def parse_assembly_list(pdf_bytes):
                 page_rows += 1
 
 
-                # ------------------------------------------------
-                # Парсим позицию
-                # ------------------------------------------------
+                # ==================================================
+                # Ищем номер отправления
+                # ==================================================
 
                 result = parse_row(
                     row_text
                 )
 
 
-                if not result:
-                    continue
+                if result:
+
+                    shipment = result[
+                        "shipment"
+                    ]
 
 
-                page_found += 1
+                    if shipment not in data:
+
+                        data[
+                            shipment
+                        ] = result
 
 
-                shipment = result[
-                    "shipment"
-                ]
-
-
-                # ------------------------------------------------
-                # Не перезаписываем корректную запись
-                # ------------------------------------------------
-
-                if shipment not in data:
-
-                    data[
-                        shipment
-                    ] = result
+                    page_found += 1
 
 
             diagnostics.append({
@@ -867,11 +829,11 @@ def parse_assembly_list(pdf_bytes):
 
 
     # ============================================================
-    # Результат
+    # ДИАГНОСТИКА
     # ============================================================
 
     st.subheader(
-        "📊 Результат разбора"
+        "📊 Диагностика листа подбора"
     )
 
 
@@ -889,7 +851,7 @@ def parse_assembly_list(pdf_bytes):
     with col2:
 
         st.metric(
-            "Отправлений",
+            "Найдено отправлений",
             len(data)
         )
 
@@ -902,13 +864,9 @@ def parse_assembly_list(pdf_bytes):
         )
 
 
-    # ============================================================
-    # Диагностика страниц
-    # ============================================================
-
     with st.expander(
         "🔍 Диагностика страниц",
-        expanded=False
+        expanded=True
     ):
 
         st.dataframe(
@@ -919,7 +877,7 @@ def parse_assembly_list(pdf_bytes):
 
 
     # ============================================================
-    # Таблица маппинга
+    # МАППИНГ
     # ============================================================
 
     if data:
@@ -963,7 +921,7 @@ def parse_assembly_list(pdf_bytes):
     else:
 
         st.error(
-            "Лист подбора не распознан."
+            "Линии найдены, но текст не попал в области между линиями."
         )
 
 
@@ -978,14 +936,11 @@ def extract_shipment_from_label(page):
 
     text = page.extract_text()
 
-
     if not text:
         return None
 
-
     # --------------------------------------------------------
     # Основной формат:
-    #
     # 78277691-0407-1
     # --------------------------------------------------------
 
@@ -994,13 +949,10 @@ def extract_shipment_from_label(page):
         text
     )
 
-
     if match:
-
         return normalize_shipment(
             match.group(0)
         )
-
 
     # --------------------------------------------------------
     # ii...
@@ -1012,16 +964,13 @@ def extract_shipment_from_label(page):
         text
     )
 
-
     match = re.search(
         r"ii\d{8,20}",
         clean,
         flags=re.IGNORECASE
     )
 
-
     if match:
-
         return normalize_shipment(
             match.group(0)
         )
@@ -1043,7 +992,6 @@ def create_info_label(
 
     packet = BytesIO()
 
-
     c = canvas.Canvas(
         packet,
         pagesize=(
@@ -1052,9 +1000,7 @@ def create_info_label(
         )
     )
 
-
     margin = 10
-
 
     # --------------------------------------------------------
     # Заказ
@@ -1065,13 +1011,11 @@ def create_info_label(
         9
     )
 
-
     c.drawString(
         margin,
         height - 16,
         f"Заказ: {order_number}"
     )
-
 
     c.line(
         margin,
@@ -1090,12 +1034,10 @@ def create_info_label(
         "-"
     )
 
-
     c.setFont(
         font_name,
         9
     )
-
 
     c.drawString(
         margin,
@@ -1113,12 +1055,10 @@ def create_info_label(
         "-"
     )
 
-
     c.setFont(
         font_name,
         11
     )
-
 
     c.drawString(
         margin,
@@ -1136,14 +1076,11 @@ def create_info_label(
         "Товар не найден"
     )
 
-
     top = height - 63
     bottom = 48
 
-
     font_size = 9
     line_height = 11
-
 
     def split_text(
         text,
@@ -1151,11 +1088,8 @@ def create_info_label(
     ):
 
         words = text.split()
-
         result = []
-
         current = ""
-
 
         for word in words:
 
@@ -1165,40 +1099,29 @@ def create_info_label(
                 " "
             )
 
-
             if len(test) <= chars:
-
                 current = test
-
             else:
-
                 if current:
-
                     result.append(
                         current.strip()
                     )
-
                 current = (
                     word +
                     " "
                 )
 
-
         if current:
-
             result.append(
                 current.strip()
             )
 
-
         return result
-
 
     lines = split_text(
         name,
         30
     )
-
 
     while (
         len(lines) * line_height
@@ -1222,29 +1145,22 @@ def create_info_label(
             )
         )
 
-
     c.setFont(
         font_name,
         font_size
     )
 
-
     y = top
 
-
     for line in lines:
-
         if y <= bottom:
             break
-
         c.drawString(
             margin,
             y,
             line
         )
-
         y -= line_height
-
 
     # --------------------------------------------------------
     # Количество
@@ -1255,12 +1171,10 @@ def create_info_label(
         "?"
     )
 
-
     c.setFont(
         font_name,
         22
     )
-
 
     c.drawString(
         margin,
@@ -1268,11 +1182,9 @@ def create_info_label(
         f"КОЛ-ВО: {qty}"
     )
 
-
     c.save()
 
     packet.seek(0)
-
 
     return PdfReader(
         packet
@@ -1284,7 +1196,6 @@ def create_info_label(
 # ============================================================
 
 col1, col2 = st.columns(2)
-
 
 with col1:
 
@@ -1314,11 +1225,9 @@ if labels_file and assembly_file:
         use_container_width=True
     ):
 
-
         with st.status(
             "Разбираем лист подбора..."
         ) as status:
-
 
             # ==================================================
             # ЛИСТ ПОДБОРА
@@ -1328,11 +1237,9 @@ if labels_file and assembly_file:
                 assembly_file.getvalue()
             )
 
-
             assembly_data = parse_assembly_list(
                 assembly_bytes
             )
-
 
             if not assembly_data:
 
@@ -1352,11 +1259,9 @@ if labels_file and assembly_file:
                 label="Разбираем этикетки..."
             )
 
-
             labels_bytes = (
                 labels_file.getvalue()
             )
-
 
             reader = PdfReader(
                 BytesIO(
@@ -1364,9 +1269,7 @@ if labels_file and assembly_file:
                 )
             )
 
-
             writer = PdfWriter()
-
 
             found = 0
             not_found = 0
@@ -1379,7 +1282,6 @@ if labels_file and assembly_file:
 
             for page in reader.pages:
 
-
                 # ------------------------------------------------
                 # Оригинальная страница
                 # ------------------------------------------------
@@ -1387,7 +1289,6 @@ if labels_file and assembly_file:
                 writer.add_page(
                     page
                 )
-
 
                 # ------------------------------------------------
                 # Номер отправления
@@ -1399,16 +1300,13 @@ if labels_file and assembly_file:
                     )
                 )
 
-
                 width = float(
                     page.mediabox.width
                 )
 
-
                 height = float(
                     page.mediabox.height
                 )
-
 
                 # =================================================
                 # Совпадение
@@ -1420,7 +1318,6 @@ if labels_file and assembly_file:
                         shipment
                     )
 
-
                     if info:
 
                         found += 1
@@ -1428,7 +1325,6 @@ if labels_file and assembly_file:
                         display_number = (
                             shipment.upper()
                         )
-
 
                     else:
 
@@ -1438,20 +1334,14 @@ if labels_file and assembly_file:
                             shipment.upper()
                         )
 
-
                         info = {
-
                             "label": "-",
-
                             "article": "-",
-
                             "qty": "?",
-
                             "name":
                                 "ОТПРАВЛЕНИЕ НЕ НАЙДЕНО "
                                 "В ЛИСТЕ ПОДБОРА"
                         }
-
 
                 # =================================================
                 # Номер не найден
@@ -1463,20 +1353,14 @@ if labels_file and assembly_file:
 
                     display_number = "???"
 
-
                     info = {
-
                         "label": "-",
-
                         "article": "-",
-
                         "qty": "-",
-
                         "name":
                             "НОМЕР ОТПРАВЛЕНИЯ "
                             "НЕ РАСПОЗНАН"
                     }
-
 
                 # =================================================
                 # Добавляем информационный лист
@@ -1513,14 +1397,11 @@ if labels_file and assembly_file:
 
         output = BytesIO()
 
-
         writer.write(
             output
         )
 
-
         output.seek(0)
-
 
         st.download_button(
             "📥 Скачать Ready_Labels.pdf",

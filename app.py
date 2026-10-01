@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 import re
 import os
@@ -1662,4 +1661,4 @@ if labels_file and assembly_file:
             "application/pdf",
             use_container_width=True
         )
-```
+        

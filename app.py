@@ -1399,4 +1399,3 @@ if labels_file and assembly_file:
             "application/pdf",
             use_container_width=True
         )
-```

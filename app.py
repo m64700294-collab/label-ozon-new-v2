@@ -1,6 +1,6 @@
 import io
-import re
 import os
+import re
 import requests
 import streamlit as st
 
@@ -11,19 +11,15 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.utils import ImageReader
 
 
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
 
-APP_TITLE = "🖨️ Склейка: Этикетки + Лист подбора"
-
 FONT_NAME = "OzonFont"
 FONT_FILE = "Roboto_Full_Final.ttf"
 
-# URL шрифта Roboto, если локального файла нет
 FONT_URL = (
     "https://github.com/googlefonts/roboto/raw/main/"
     "src/hinted/Roboto-Regular.ttf"
@@ -40,11 +36,11 @@ st.set_page_config(
     layout="centered"
 )
 
-st.title(APP_TITLE)
+st.title("🖨️ Склейка: Этикетки + Лист подбора")
 
 st.caption(
-    "Загрузите PDF с этикетками и PDF с листом подбора. "
-    "К каждой этикетке будет добавлен лист с товаром, артикулом и количеством."
+    "К каждой этикетке будет добавлен лист с товаром, "
+    "артикулом и количеством."
 )
 
 
@@ -54,36 +50,39 @@ st.caption(
 
 @st.cache_resource
 def load_font():
-    """
-    Загружает Roboto для корректной работы с кириллицей.
-    """
 
-    # Если шрифт уже зарегистрирован — просто возвращаем имя.
     try:
         pdfmetrics.getFont(FONT_NAME)
         return FONT_NAME
     except Exception:
         pass
 
-    # Ищем локальный файл
-    local_candidates = [
-        FONT_FILE,
-        os.path.join(os.getcwd(), FONT_FILE),
-        os.path.join(os.path.dirname(__file__), FONT_FILE)
-        if "__file__" in globals()
-        else ""
-    ]
-
     font_path = None
 
-    for candidate in local_candidates:
-        if candidate and os.path.exists(candidate):
-            font_path = candidate
+    candidates = [
+        FONT_FILE,
+        os.path.join(os.getcwd(), FONT_FILE),
+    ]
+
+    try:
+        candidates.append(
+            os.path.join(
+                os.path.dirname(__file__),
+                FONT_FILE
+            )
+        )
+    except Exception:
+        pass
+
+    for path in candidates:
+        if path and os.path.exists(path):
+            font_path = path
             break
 
-    # Если локального файла нет — скачиваем
     if not font_path:
+
         try:
+
             response = requests.get(
                 FONT_URL,
                 timeout=30
@@ -93,27 +92,37 @@ def load_font():
 
             font_path = FONT_FILE
 
-            with open(font_path, "wb") as f:
-                f.write(response.content)
+            with open(
+                font_path,
+                "wb"
+            ) as f:
+                f.write(
+                    response.content
+                )
 
         except Exception as e:
+
             st.error(
-                "Не удалось загрузить шрифт Roboto. "
-                f"Ошибка: {e}"
+                f"Не удалось загрузить шрифт: {e}"
             )
+
             st.stop()
 
     try:
+
         pdfmetrics.registerFont(
             TTFont(
                 FONT_NAME,
                 font_path
             )
         )
+
     except Exception as e:
+
         st.error(
             f"Не удалось зарегистрировать шрифт: {e}"
         )
+
         st.stop()
 
     return FONT_NAME
@@ -123,139 +132,10 @@ FONT = load_font()
 
 
 # ============================================================
-# РАБОТА С НОМЕРОМ ОТПРАВЛЕНИЯ
-# ============================================================
-
-ORDER_PATTERN = re.compile(
-    r"""
-    (
-        \d{8,15}-\d{4}-\d+
-        |
-        [A-Za-zА-Яа-я]{0,4}\d{8,20}
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE
-)
-
-
-def normalize_order(value):
-    """
-    Нормализует номер отправления.
-    """
-
-    if not value:
-        return ""
-
-    value = str(value).strip()
-
-    value = value.replace("\xa0", " ")
-
-    value = re.sub(
-        r"\s+",
-        "",
-        value
-    )
-
-    return value.upper()
-
-
-def get_short_code(order):
-    """
-    Для:
-        78277691-0407-1
-
-    возвращает:
-        7691
-
-    То есть последние 4 цифры первой части.
-    """
-
-    order = normalize_order(order)
-
-    if not order:
-        return ""
-
-    parts = order.split("-")
-
-    if parts:
-        first = re.sub(
-            r"\D",
-            "",
-            parts[0]
-        )
-
-        if len(first) >= 4:
-            return first[-4:]
-
-    digits = re.sub(
-        r"\D",
-        "",
-        order
-    )
-
-    if len(digits) >= 4:
-        return digits[-4:]
-
-    return digits
-
-
-def get_numeric_key(order):
-    """
-    Только цифры из номера отправления.
-    """
-
-    if not order:
-        return ""
-
-    return re.sub(
-        r"\D",
-        "",
-        str(order)
-    )
-
-
-def get_last10_key(order):
-    """
-    Последние 10 цифр номера.
-    """
-
-    numeric = get_numeric_key(order)
-
-    if len(numeric) >= 10:
-        return numeric[-10:]
-
-    return numeric
-
-
-def find_orders(text):
-    """
-    Находит номера отправлений в тексте блока.
-    """
-
-    if not text:
-        return []
-
-    matches = ORDER_PATTERN.findall(text)
-
-    result = []
-
-    for item in matches:
-        normalized = normalize_order(item)
-
-        if normalized and normalized not in result:
-            result.append(normalized)
-
-    return result
-
-
-# ============================================================
-# НОРМАЛИЗАЦИЯ ТЕКСТА
+# НОРМАЛИЗАЦИЯ
 # ============================================================
 
 def normalize_spaces(text):
-    """
-    Убирает лишние пробелы и переносы.
-    """
 
     if not text:
         return ""
@@ -273,19 +153,21 @@ def normalize_spaces(text):
     )
 
     text = re.sub(
-        r"\s+",
+        r"[ \t]+",
         " ",
+        text
+    )
+
+    text = re.sub(
+        r"\n+",
+        "\n",
         text
     )
 
     return text.strip()
 
 
-def normalize_field_names(text):
-    """
-    Приводит разные варианты написания полей
-    к единому виду.
-    """
+def flat_text(text):
 
     if not text:
         return ""
@@ -295,79 +177,159 @@ def normalize_field_names(text):
         " "
     )
 
-    # Номер отправления
     text = re.sub(
-        r"Номер\s+отправления",
-        "Номер отправления",
-        text,
-        flags=re.IGNORECASE
+        r"\s+",
+        " ",
+        text
     )
 
-    # Номер с этикетки
-    text = re.sub(
-        r"Номер\s+с\s+этикетки",
-        "Номер с этикетки",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    # Фото Товар
-    text = re.sub(
-        r"Фото\s+Товар",
-        "Товар",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    # Фото + перенос + Товар
-    text = re.sub(
-        r"Фото\s+.*?\s+Товар",
-        "Товар",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    # Кол-во / Кол во / Кол-во
-    text = re.sub(
-        r"Кол\s*[-–—]?\s*во",
-        "Кол-во",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    # Артикул
-    text = re.sub(
-        r"\bАртикул\b",
-        "Артикул",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    # Этикетка
-    text = re.sub(
-        r"\bЭтикетка\b",
-        "Этикетка",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    return text
+    return text.strip()
 
 
 # ============================================================
-# УДАЛЕНИЕ НОМЕРОВ ОТПРАВЛЕНИЙ
+# НОМЕРА ОТПРАВЛЕНИЙ
 # ============================================================
 
-def remove_orders(text, orders):
-    """
-    Удаляет номера отправлений из текста,
-    чтобы они не попали случайно в товар/артикул.
-    """
+# Основной формат Ozon:
+#
+# 78277691-0407-1
+#
+# Также допускаем варианты без дефисов.
+ORDER_PATTERN = re.compile(
+    r"""
+    (?:
+        \d{6,20}-\d{2,10}-\d{1,10}
+        |
+        \d{10,25}
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
 
-    if not text:
+
+def normalize_order(value):
+
+    if not value:
         return ""
 
-    result = text
+    value = str(value)
+
+    value = value.replace(
+        "\xa0",
+        " "
+    )
+
+    value = re.sub(
+        r"\s+",
+        "",
+        value
+    )
+
+    return value.upper()
+
+
+def get_numeric_key(value):
+
+    if not value:
+        return ""
+
+    return re.sub(
+        r"\D",
+        "",
+        str(value)
+    )
+
+
+def get_last10_key(value):
+
+    digits = get_numeric_key(
+        value
+    )
+
+    if len(digits) >= 10:
+        return digits[-10:]
+
+    return digits
+
+
+def get_short_code(value):
+
+    """
+    Для:
+
+        78277691-0407-1
+
+    получаем:
+
+        7691
+
+    ВАЖНО:
+    это последние 4 цифры первой части номера.
+    """
+
+    value = normalize_order(
+        value
+    )
+
+    if not value:
+        return ""
+
+    parts = value.split("-")
+
+    if parts:
+
+        first = re.sub(
+            r"\D",
+            "",
+            parts[0]
+        )
+
+        if len(first) >= 4:
+            return first[-4:]
+
+    digits = get_numeric_key(
+        value
+    )
+
+    if len(digits) >= 4:
+        return digits[-4:]
+
+    return digits
+
+
+def find_orders(text):
+
+    if not text:
+        return []
+
+    result = []
+
+    for match in ORDER_PATTERN.findall(
+        text
+    ):
+
+        order = normalize_order(
+            match
+        )
+
+        if order and order not in result:
+            result.append(
+                order
+            )
+
+    return result
+
+
+# ============================================================
+# УДАЛЕНИЕ НОМЕРОВ ИЗ БЛОКА
+# ============================================================
+
+def remove_orders(
+    text,
+    orders
+):
+
+    result = text or ""
 
     for order in orders or []:
 
@@ -385,35 +347,75 @@ def remove_orders(text, orders):
 
 
 # ============================================================
-# ИЗВЛЕЧЕНИЕ МЕЖДУ ДВУМЯ ПОЛЯМИ
+# НОРМАЛИЗАЦИЯ ЗАГОЛОВКОВ
+# ============================================================
+
+def normalize_headers(text):
+
+    if not text:
+        return ""
+
+    text = text.replace(
+        "\xa0",
+        " "
+    )
+
+    # Фото Товар -> Товар
+    text = re.sub(
+        r"Фото\s+Товар",
+        "Товар",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    # Возможный перенос:
+    # Фото
+    # Товар
+    text = re.sub(
+        r"Фото\s+Товар",
+        "Товар",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    # Кол во
+    # Кол-во
+    # Кол – во
+    text = re.sub(
+        r"Кол\s*[-–—]?\s*во",
+        "Кол-во",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    # Номер с этикетки
+    text = re.sub(
+        r"Номер\s+с\s+этикетки",
+        "Номер с этикетки",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    return text
+
+
+# ============================================================
+# ИЗВЛЕЧЕНИЕ МЕЖДУ ПОЛЯМИ
 # ============================================================
 
 def extract_between(
     text,
-    start_pattern,
-    end_pattern
+    start,
+    end
 ):
-    """
-    Берёт содержимое между двумя маркерами.
-
-    Например:
-
-        Товар
-        Антикоррозионное покрытие
-        Артикул
-
-    даст:
-
-        Антикоррозионное покрытие
-    """
 
     if not text:
         return ""
 
     pattern = (
-        start_pattern
+        start
         + r"\s*(.*?)\s*"
-        + end_pattern
+        + end
     )
 
     match = re.search(
@@ -425,48 +427,25 @@ def extract_between(
     if not match:
         return ""
 
-    result = match.group(1)
+    value = match.group(1)
 
-    result = normalize_spaces(result)
+    value = flat_text(
+        value
+    )
 
-    return result.strip(
-        " \t\r\n-–—:"
+    return value.strip(
+        " -–—:"
     )
 
 
 # ============================================================
-# РАЗБОР ТОВАРА
+# ПАРСИНГ ТОВАРНОГО БЛОКА
 # ============================================================
 
-def parse_product_block(text, orders):
-    """
-    Основной разбор блока листа подбора.
-
-    Структура:
-
-        Номер отправления
-        78277691-0407-1
-
-        Фото Товар
-        Антикоррозионное покрытие для авто MW Service
-
-        Артикул
-        MW1801
-
-        Кол-во
-        1
-
-        Этикетка
-        7691
-
-    Возвращает:
-
-        {
-            "name": "...",
-            "article": "...",
-            "qty": 1
-        }
-    """
+def parse_product_block(
+    text,
+    orders
+):
 
     result = {
         "name": "Товар",
@@ -481,25 +460,19 @@ def parse_product_block(text, orders):
     # Подготовка
     # --------------------------------------------------------
 
-    clean = text.replace(
-        "\xa0",
-        " "
+    text = normalize_headers(
+        text
     )
 
-    clean = normalize_field_names(
-        clean
-    )
-
-    # Сначала пробуем удалить номера отправлений
-    clean_without_orders = remove_orders(
-        clean,
+    # Важно: удаляем номера отправлений,
+    # чтобы они не попали в товар/артикул.
+    clean = remove_orders(
+        text,
         orders
     )
 
-    # Очень важно:
-    # переводим всё в одну строку.
-    flat = normalize_spaces(
-        clean_without_orders
+    flat = flat_text(
+        clean
     )
 
     if not flat:
@@ -515,14 +488,6 @@ def parse_product_block(text, orders):
         r"\bАртикул\b"
     )
 
-    # Иногда в PDF перед "Товар" остаётся слово Фото.
-    if not name:
-        name = extract_between(
-            flat,
-            r"\bФото\s+Товар\b",
-            r"\bАртикул\b"
-        )
-
     # --------------------------------------------------------
     # АРТИКУЛ
     # --------------------------------------------------------
@@ -535,9 +500,21 @@ def parse_product_block(text, orders):
 
     # --------------------------------------------------------
     # КОЛИЧЕСТВО
+    #
+    # КРИТИЧЕСКИ ВАЖНО:
+    #
+    # ищем число только между:
+    #
+    # Кол-во
+    #
+    # и
+    #
+    # Этикетка
+    #
+    # Поэтому 7691 ниже не попадёт.
     # --------------------------------------------------------
 
-    qty_block = extract_between(
+    qty_text = extract_between(
         flat,
         r"\bКол-во\b",
         r"\bЭтикетка\b"
@@ -545,118 +522,96 @@ def parse_product_block(text, orders):
 
     qty = 1
 
-    if qty_block:
+    if qty_text:
 
-        # Только число, находящееся между Кол-во и Этикетка
         qty_match = re.search(
             r"(?<!\d)(\d{1,3})(?!\d)",
-            qty_block
+            qty_text
         )
 
         if qty_match:
 
             try:
 
-                parsed_qty = int(
+                value = int(
                     qty_match.group(1)
                 )
 
-                if parsed_qty > 0:
-                    qty = parsed_qty
+                if value > 0:
+                    qty = value
 
             except Exception:
                 qty = 1
 
     # --------------------------------------------------------
-    # ОЧИСТКА ТОВАРА
-    # --------------------------------------------------------
-
-    if name:
-
-        name = normalize_spaces(
-            name
-        )
-
-        # Если вдруг внутри остались служебные слова
-        name = re.sub(
-            r"^\s*(Фото\s+)?Товар\s*",
-            "",
-            name,
-            flags=re.IGNORECASE
-        )
-
-        name = name.strip(
-            " -–—:"
-        )
-
-    # --------------------------------------------------------
-    # ОЧИСТКА АРТИКУЛА
-    # --------------------------------------------------------
-
-    if article:
-
-        article = normalize_spaces(
-            article
-        )
-
-        article = article.strip(
-            " -–—:"
-        )
-
-        # Иногда PDF может вернуть служебное слово
-        if article.lower() in {
-            "кол-во",
-            "этикетка",
-            "товар"
-        }:
-            article = ""
-
-    # --------------------------------------------------------
-    # ЗАЩИТНЫЙ FALLBACK ДЛЯ АРТИКУЛА
-    # --------------------------------------------------------
-
-    if not article:
-
-        # Ищем значение непосредственно после Артикул
-        article_match = re.search(
-            r"\bАртикул\b\s+"
-            r"([A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9._/-]{0,50})"
-            r"\s+\bКол-во\b",
-            flat,
-            flags=re.IGNORECASE
-        )
-
-        if article_match:
-
-            article = article_match.group(
-                1
-            ).strip()
-
-    # --------------------------------------------------------
-    # FALLBACK ДЛЯ ТОВАРА
+    # Дополнительный fallback для товара
     # --------------------------------------------------------
 
     if not name:
 
-        # Ищем любой текст между Товар и Артикул
         match = re.search(
-            r"\bТовар\b\s+"
-            r"(.+?)"
-            r"\s+\bАртикул\b",
+            r"\bТовар\b\s*(.+?)\s+\bАртикул\b",
             flat,
             flags=re.IGNORECASE
         )
 
         if match:
 
-            name = normalize_spaces(
+            name = flat_text(
                 match.group(1)
-            ).strip(
-                " -–—:"
             )
 
     # --------------------------------------------------------
-    # Финальные значения
+    # Дополнительный fallback для артикула
+    # --------------------------------------------------------
+
+    if not article:
+
+        match = re.search(
+            r"\bАртикул\b\s*"
+            r"(.+?)"
+            r"\s+\bКол-во\b",
+            flat,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+
+            article = flat_text(
+                match.group(1)
+            )
+
+    # --------------------------------------------------------
+    # Чистим
+    # --------------------------------------------------------
+
+    if name:
+
+        name = name.strip(
+            " -–—:"
+        )
+
+    if article:
+
+        article = article.strip(
+            " -–—:"
+        )
+
+    # --------------------------------------------------------
+    # Если артикул содержит несколько пробелов —
+    # приводим к нормальному виду.
+    # --------------------------------------------------------
+
+    article = flat_text(
+        article
+    )
+
+    name = flat_text(
+        name
+    )
+
+    # --------------------------------------------------------
+    # Защита от случайного мусора
     # --------------------------------------------------------
 
     if not name:
@@ -676,89 +631,219 @@ def parse_product_block(text, orders):
 
 
 # ============================================================
-# ПОЛУЧЕНИЕ ГОРИЗОНТАЛЬНЫХ БЛОКОВ
+# ГОРИЗОНТАЛЬНЫЕ ЛИНИИ
 # ============================================================
 
-def get_horizontal_boundaries(page):
-    """
-    Получает горизонтальные линии PDF.
+def get_horizontal_lines(
+    page
+):
 
-    Они используются для разделения товаров
-    на отдельные блоки.
-    """
-
-    lines = []
+    result = []
 
     try:
-        page_lines = page.lines or []
+        lines = page.lines or []
     except Exception:
-        page_lines = []
+        lines = []
 
-    for line in page_lines:
+    for line in lines:
 
         try:
 
-            x0 = float(line.get("x0", 0))
-            x1 = float(line.get("x1", 0))
-            y0 = float(line.get("y0", 0))
-            y1 = float(line.get("y1", 0))
+            x0 = float(
+                line.get(
+                    "x0",
+                    0
+                )
+            )
 
-            width = abs(x1 - x0)
-            height = abs(y1 - y0)
+            x1 = float(
+                line.get(
+                    "x1",
+                    0
+                )
+            )
 
-            # Горизонтальная линия
-            if width >= 30 and height <= 3:
-                lines.append(
-                    (y0, x0, x1)
+            y0 = float(
+                line.get(
+                    "y0",
+                    0
+                )
+            )
+
+            y1 = float(
+                line.get(
+                    "y1",
+                    0
+                )
+            )
+
+            width = abs(
+                x1 - x0
+            )
+
+            height = abs(
+                y1 - y0
+            )
+
+            if (
+                width >= 30
+                and height <= 3
+            ):
+
+                result.append(
+                    y0
                 )
 
         except Exception:
             continue
 
-    # Сортируем по Y
-    lines.sort(
-        key=lambda x: x[0]
+    result.sort()
+
+    # Убираем почти одинаковые
+    # координаты линий.
+    unique = []
+
+    for y in result:
+
+        if not unique:
+
+            unique.append(
+                y
+            )
+
+        elif abs(
+            y - unique[-1]
+        ) > 2:
+
+            unique.append(
+                y
+            )
+
+    return unique
+
+
+# ============================================================
+# ДОБАВЛЕНИЕ В ИНДЕКС
+# ============================================================
+
+def add_item_to_index(
+    index,
+    item
+):
+
+    order = item.get(
+        "order",
+        ""
     )
 
-    return lines
+    # --------------------------------------------------------
+    # Полный номер
+    # --------------------------------------------------------
+
+    normalized = normalize_order(
+        order
+    )
+
+    if normalized:
+
+        index[
+            "ORDER_" + normalized
+        ] = item
+
+    # --------------------------------------------------------
+    # Numeric
+    # --------------------------------------------------------
+
+    numeric = get_numeric_key(
+        order
+    )
+
+    if numeric:
+
+        index[
+            "NUM_" + numeric
+        ] = item
+
+    # --------------------------------------------------------
+    # Last 10
+    # --------------------------------------------------------
+
+    last10 = get_last10_key(
+        order
+    )
+
+    if last10:
+
+        index[
+            "LAST10_" + last10
+        ] = item
+
+    # --------------------------------------------------------
+    # Короткий код
+    # --------------------------------------------------------
+
+    short = get_short_code(
+        order
+    )
+
+    if short:
+
+        # Не перезаписываем хороший товар
+        # пустым/неполным.
+        old = index.get(
+            "SHORT_" + short
+        )
+
+        if old is None:
+
+            index[
+                "SHORT_" + short
+            ] = item
+
+        else:
+
+            old_article = old.get(
+                "article",
+                "-"
+            )
+
+            new_article = item.get(
+                "article",
+                "-"
+            )
+
+            if (
+                old_article == "-"
+                and new_article != "-"
+            ):
+
+                index[
+                    "SHORT_" + short
+                ] = item
 
 
 # ============================================================
 # ПАРСИНГ ЛИСТА ПОДБОРА
 # ============================================================
 
-def parse_assembly_list(pdf_file):
-    """
-    Читает PDF листа подбора.
+def parse_assembly_list(
+    pdf_file
+):
 
-    Возвращает словарь:
-
-        {
-            "7691": {
-                "order": "78277691-0407-1",
-                "name": "...",
-                "article": "MW1801",
-                "qty": 1
-            }
-        }
-    """
-
-    items = {}
+    index = {}
 
     try:
         pdf_file.seek(0)
-    except Exception:
-        pass
-
-    try:
 
         pdf_bytes = pdf_file.read()
 
         if not pdf_bytes:
+
             st.error(
                 "PDF листа подбора пустой."
             )
-            return items
+
+            return index
 
         with pdfplumber.open(
             io.BytesIO(pdf_bytes)
@@ -773,8 +858,6 @@ def parse_assembly_list(pdf_file):
                 text="Читаем лист подбора..."
             )
 
-            debug_blocks = []
-
             for page_number, page in enumerate(
                 pdf.pages,
                 start=1
@@ -782,50 +865,135 @@ def parse_assembly_list(pdf_file):
 
                 try:
 
-                    lines = get_horizontal_boundaries(
+                    y_lines = get_horizontal_lines(
                         page
                     )
 
-                    # ------------------------------------------------
-                    # Если горизонтальных линий нет
-                    # ------------------------------------------------
+                    # =================================================
+                    # ВАРИАНТ 1:
+                    # Есть горизонтальные линии.
+                    # =================================================
 
-                    if len(lines) < 2:
+                    if len(y_lines) >= 2:
 
-                        try:
-                            full_text = (
-                                page.extract_text(
-                                    layout=False
+                        for i in range(
+                            len(y_lines) - 1
+                        ):
+
+                            top = y_lines[i]
+                            bottom = y_lines[i + 1]
+
+                            if (
+                                bottom - top
+                                < 20
+                            ):
+                                continue
+
+                            try:
+
+                                cropped = page.crop(
+                                    (
+                                        0,
+                                        top,
+                                        page.width,
+                                        bottom
+                                    )
                                 )
-                                or ""
+
+                            except Exception:
+                                continue
+
+                            # -----------------------------------------
+                            # Основной текст
+                            # -----------------------------------------
+
+                            try:
+
+                                text = (
+                                    cropped.extract_text(
+                                        layout=False
+                                    )
+                                    or ""
+                                )
+
+                            except Exception:
+
+                                text = ""
+
+                            # -----------------------------------------
+                            # Если normal пустой — layout
+                            # -----------------------------------------
+
+                            if not text.strip():
+
+                                try:
+
+                                    text = (
+                                        cropped.extract_text(
+                                            layout=True
+                                        )
+                                        or ""
+                                    )
+
+                                except Exception:
+
+                                    text = ""
+
+                            if not text.strip():
+                                continue
+
+                            # -----------------------------------------
+                            # Номер отправления
+                            # -----------------------------------------
+
+                            orders = find_orders(
+                                text
                             )
-                        except Exception:
-                            full_text = ""
 
-                        orders = find_orders(
-                            full_text
-                        )
+                            # -----------------------------------------
+                            # Если не нашли —
+                            # пробуем layout отдельно.
+                            # -----------------------------------------
 
-                        if orders:
+                            if not orders:
+
+                                try:
+
+                                    layout_text = (
+                                        cropped.extract_text(
+                                            layout=True
+                                        )
+                                        or ""
+                                    )
+
+                                except Exception:
+
+                                    layout_text = ""
+
+                                orders = find_orders(
+                                    layout_text
+                                )
+
+                                if orders:
+                                    text = layout_text
+
+                            if not orders:
+                                continue
+
+                            # -----------------------------------------
+                            # Товар
+                            # -----------------------------------------
 
                             data = parse_product_block(
-                                full_text,
+                                text,
                                 orders
                             )
 
+                            # -----------------------------------------
+                            # Индекс
+                            # -----------------------------------------
+
                             for order in orders:
-
-                                short = get_short_code(
-                                    order
-                                )
-
-                                numeric = get_numeric_key(
-                                    order
-                                )
-
-                                last10 = get_last10_key(
-                                    order
-                                )
 
                                 item = {
                                     "order": order,
@@ -834,316 +1002,88 @@ def parse_assembly_list(pdf_file):
                                     "qty": data["qty"]
                                 }
 
-                                if short:
-                                    items[
-                                        short
-                                    ] = item
+                                add_item_to_index(
+                                    index,
+                                    item
+                                )
 
-                                if numeric:
-                                    items[
-                                        "NUM_" + numeric
-                                    ] = item
+                    # =================================================
+                    # ВАРИАНТ 2:
+                    # Нет горизонтальных линий.
+                    # Читаем страницу целиком.
+                    # =================================================
 
-                                if last10:
-                                    items[
-                                        "LAST10_" + last10
-                                    ] = item
-
-                        progress.progress(
-                            page_number / total_pages,
-                            text=(
-                                f"Страница "
-                                f"{page_number}/{total_pages}"
-                            )
-                        )
-
-                        continue
-
-                    # ------------------------------------------------
-                    # Формируем границы блоков
-                    # ------------------------------------------------
-
-                    y_values = [
-                        line[0]
-                        for line in lines
-                    ]
-
-                    # Убираем почти одинаковые линии
-                    unique_y = []
-
-                    for y in y_values:
-
-                        if not unique_y:
-                            unique_y.append(y)
-                            continue
-
-                        if abs(
-                            y - unique_y[-1]
-                        ) > 2:
-                            unique_y.append(y)
-
-                    # ------------------------------------------------
-                    # Если линий всё равно мало
-                    # ------------------------------------------------
-
-                    if len(unique_y) < 2:
+                    else:
 
                         try:
-                            full_text = (
+
+                            text = (
                                 page.extract_text(
                                     layout=False
                                 )
                                 or ""
                             )
-                        except Exception:
-                            full_text = ""
-
-                        orders = find_orders(
-                            full_text
-                        )
-
-                        if orders:
-
-                            data = parse_product_block(
-                                full_text,
-                                orders
-                            )
-
-                            for order in orders:
-
-                                item = {
-                                    "order": order,
-                                    "name": data["name"],
-                                    "article": data["article"],
-                                    "qty": data["qty"]
-                                }
-
-                                short = get_short_code(
-                                    order
-                                )
-
-                                numeric = get_numeric_key(
-                                    order
-                                )
-
-                                last10 = get_last10_key(
-                                    order
-                                )
-
-                                if short:
-                                    items[short] = item
-
-                                if numeric:
-                                    items[
-                                        "NUM_" + numeric
-                                    ] = item
-
-                                if last10:
-                                    items[
-                                        "LAST10_" + last10
-                                    ] = item
-
-                        continue
-
-                    # ------------------------------------------------
-                    # Каждый участок между линиями = товар
-                    # ------------------------------------------------
-
-                    for i in range(
-                        len(unique_y) - 1
-                    ):
-
-                        top = unique_y[i]
-                        bottom = unique_y[i + 1]
-
-                        # Не обрабатываем слишком маленькие блоки
-                        if abs(
-                            bottom - top
-                        ) < 20:
-                            continue
-
-                        try:
-
-                            cropped = page.crop(
-                                (
-                                    0,
-                                    top,
-                                    page.width,
-                                    bottom
-                                )
-                            )
 
                         except Exception:
-                            continue
 
-                        # ------------------------------------------------
-                        # Получаем текст ДВУМЯ способами.
-                        #
-                        # layout=False — для надёжного парсинга.
-                        # layout=True — иногда лучше сохраняет
-                        # визуальную структуру.
-                        # ------------------------------------------------
-
-                        text_normal = ""
-
-                        try:
-                            text_normal = (
-                                cropped.extract_text(
-                                    layout=False
-                                )
-                                or ""
-                            )
-                        except Exception:
-                            pass
-
-                        text_layout = ""
-
-                        try:
-                            text_layout = (
-                                cropped.extract_text(
-                                    layout=True
-                                )
-                                or ""
-                            )
-                        except Exception:
-                            pass
-
-                        # Для поиска используем normal.
-                        # Если он пустой — layout.
-                        text = (
-                            text_normal
-                            if text_normal.strip()
-                            else text_layout
-                        )
+                            text = ""
 
                         if not text.strip():
-                            continue
 
-                        # ------------------------------------------------
-                        # Ищем номер отправления
-                        # ------------------------------------------------
+                            try:
+
+                                text = (
+                                    page.extract_text(
+                                        layout=True
+                                    )
+                                    or ""
+                                )
+
+                            except Exception:
+
+                                text = ""
 
                         orders = find_orders(
                             text
                         )
 
-                        if not orders:
+                        if orders:
 
-                            # Иногда normal extraction
-                            # теряет номер, а layout его сохраняет.
-                            if text_layout:
+                            data = parse_product_block(
+                                text,
+                                orders
+                            )
 
-                                orders = find_orders(
-                                    text_layout
+                            for order in orders:
+
+                                item = {
+                                    "order": order,
+                                    "name": data["name"],
+                                    "article": data["article"],
+                                    "qty": data["qty"]
+                                }
+
+                                add_item_to_index(
+                                    index,
+                                    item
                                 )
-
-                                if orders:
-                                    text = text_layout
-
-                        if not orders:
-                            continue
-
-                        # ------------------------------------------------
-                        # Парсим товар
-                        # ------------------------------------------------
-
-                        data = parse_product_block(
-                            text,
-                            orders
-                        )
-
-                        # ------------------------------------------------
-                        # Создаём запись
-                        # ------------------------------------------------
-
-                        for order in orders:
-
-                            item = {
-                                "order": order,
-                                "name": data["name"],
-                                "article": data["article"],
-                                "qty": data["qty"]
-                            }
-
-                            # -----------------------------
-                            # Короткий код
-                            # -----------------------------
-
-                            short = get_short_code(
-                                order
-                            )
-
-                            if short:
-
-                                # Если код уже существует,
-                                # не перезаписываем нормальный
-                                # товар пустым.
-                                old = items.get(
-                                    short
-                                )
-
-                                if (
-                                    old is None
-                                    or (
-                                        old.get("article") == "-"
-                                        and data["article"] != "-"
-                                    )
-                                ):
-                                    items[short] = item
-
-                            # -----------------------------
-                            # Полный numeric key
-                            # -----------------------------
-
-                            numeric = get_numeric_key(
-                                order
-                            )
-
-                            if numeric:
-
-                                items[
-                                    "NUM_" + numeric
-                                ] = item
-
-                            # -----------------------------
-                            # Последние 10 цифр
-                            # -----------------------------
-
-                            last10 = get_last10_key(
-                                order
-                            )
-
-                            if last10:
-
-                                items[
-                                    "LAST10_" + last10
-                                ] = item
-
-                            # -----------------------------
-                            # Debug
-                            # -----------------------------
-
-                            debug_blocks.append({
-                                "page": page_number,
-                                "order": order,
-                                "short": short,
-                                "name": data["name"],
-                                "article": data["article"],
-                                "qty": data["qty"]
-                            })
 
                 except Exception as e:
 
                     st.warning(
-                        f"Ошибка на странице "
+                        f"Ошибка страницы "
                         f"{page_number}: {e}"
                     )
 
                 progress.progress(
-                    page_number / total_pages,
+                    page_number / max(
+                        total_pages,
+                        1
+                    ),
                     text=(
-                        f"Страница "
-                        f"{page_number}/{total_pages}"
+                        f"Лист подбора: "
+                        f"{page_number}/"
+                        f"{total_pages}"
                     )
                 )
 
@@ -1152,131 +1092,234 @@ def parse_assembly_list(pdf_file):
     except Exception as e:
 
         st.error(
-            "Не удалось обработать PDF листа подбора."
+            "Ошибка при чтении листа подбора."
         )
 
         st.exception(e)
 
-        return {}
-
-    return items
+    return index
 
 
 # ============================================================
-# ПОИСК ДАННЫХ ДЛЯ ЭТИКЕТКИ
+# ПОИСК ТОВАРА ПО ЭТИКЕТКЕ
 # ============================================================
 
-def find_item_for_order(
+def find_item_for_label(
     order,
-    items
+    short_code,
+    index
 ):
-    """
-    Ищет товар по номеру отправления.
 
-    Порядок:
-        1. короткий код
-        2. полный numeric
-        3. последние 10 цифр
-    """
+    # ========================================================
+    # 1. Полный номер
+    # ========================================================
 
-    if not order:
-        return None
-
-    order = normalize_order(
+    normalized = normalize_order(
         order
     )
 
-    # 1. Short code
-    short = get_short_code(
-        order
-    )
+    if normalized:
 
-    if short:
-
-        item = items.get(
-            short
+        item = index.get(
+            "ORDER_" + normalized
         )
 
         if item:
             return item
 
-    # 2. Полный номер
+    # ========================================================
+    # 2. Цифры полного номера
+    # ========================================================
+
     numeric = get_numeric_key(
         order
     )
 
     if numeric:
 
-        item = items.get(
+        item = index.get(
             "NUM_" + numeric
         )
 
         if item:
             return item
 
+    # ========================================================
     # 3. Последние 10 цифр
+    # ========================================================
+
     last10 = get_last10_key(
         order
     )
 
     if last10:
 
-        item = items.get(
+        item = index.get(
             "LAST10_" + last10
         )
 
         if item:
             return item
 
+    # ========================================================
+    # 4. Короткий код с этикетки
+    # ========================================================
+
+    if short_code:
+
+        short_code = re.sub(
+            r"\D",
+            "",
+            str(short_code)
+        )
+
+        if short_code:
+
+            item = index.get(
+                "SHORT_" + short_code
+            )
+
+            if item:
+                return item
+
     return None
 
 
 # ============================================================
-# ИЗВЛЕЧЕНИЕ НОМЕРА С ЭТИКЕТКИ
+# ИЗВЛЕЧЕНИЕ ДАННЫХ С ЭТИКЕТКИ
 # ============================================================
 
-def extract_order_from_label(
+def extract_label_identifiers(
     page
 ):
-    """
-    Извлекает номер отправления из страницы этикетки.
-    """
 
-    text = ""
+    texts = []
+
+    # --------------------------------------------------------
+    # Обычный текст
+    # --------------------------------------------------------
 
     try:
-        text = page.extract_text() or ""
+
+        text = page.extract_text(
+            layout=False
+        ) or ""
+
+        if text:
+            texts.append(
+                text
+            )
+
     except Exception:
         pass
 
-    if not text:
-        try:
-            text = page.extract_text(
-                layout=True
-            ) or ""
-        except Exception:
-            text = ""
+    # --------------------------------------------------------
+    # Layout
+    # --------------------------------------------------------
 
-    if not text:
-        return ""
+    try:
 
-    orders = find_orders(
-        text
-    )
+        text = page.extract_text(
+            layout=True
+        ) or ""
 
-    if not orders:
-        return ""
+        if text:
+            texts.append(
+                text
+            )
 
-    # Предпочитаем длинный номер с дефисами
-    hyphen_orders = [
-        x for x in orders
-        if "-" in x
-    ]
+    except Exception:
+        pass
 
-    if hyphen_orders:
-        return hyphen_orders[0]
+    # --------------------------------------------------------
+    # Собираем все номера
+    # --------------------------------------------------------
 
-    return orders[0]
+    all_orders = []
+
+    for text in texts:
+
+        orders = find_orders(
+            text
+        )
+
+        for order in orders:
+
+            if order not in all_orders:
+
+                all_orders.append(
+                    order
+                )
+
+    # --------------------------------------------------------
+    # Основной номер
+    # --------------------------------------------------------
+
+    order = ""
+
+    if all_orders:
+
+        # Сначала номер с дефисами
+        for candidate in all_orders:
+
+            if "-" in candidate:
+
+                order = candidate
+                break
+
+        if not order:
+            order = all_orders[0]
+
+    # --------------------------------------------------------
+    # Короткий код
+    # --------------------------------------------------------
+
+    short_code = ""
+
+    if order:
+
+        short_code = get_short_code(
+            order
+        )
+
+    # --------------------------------------------------------
+    # Если полного номера нет,
+    # ищем отдельный 4-значный код.
+    #
+    # Это важно для Ozon этикеток.
+    # --------------------------------------------------------
+
+    if not short_code:
+
+        candidates = []
+
+        for text in texts:
+
+            # Все отдельные 4-значные числа
+            found = re.findall(
+                r"(?<!\d)(\d{4})(?!\d)",
+                text
+            )
+
+            for value in found:
+
+                if value not in candidates:
+                    candidates.append(
+                        value
+                    )
+
+        # Предпочитаем последние найденные.
+        # В типичной этикетке код расположен
+        # ближе к номеру отправления.
+        if candidates:
+
+            short_code = candidates[-1]
+
+    return {
+        "order": order,
+        "short_code": short_code,
+        "texts": texts
+    }
 
 
 # ============================================================
@@ -1287,16 +1330,16 @@ def wrap_text(
     text,
     max_chars
 ):
-    """
-    Разбивает длинный текст на строки.
-    """
 
     if not text:
         return [""]
 
-    words = str(text).split()
+    words = str(
+        text
+    ).split()
 
     lines = []
+
     current = ""
 
     for word in words:
@@ -1305,9 +1348,16 @@ def wrap_text(
 
             current = word
 
-        elif len(current) + 1 + len(word) <= max_chars:
+        elif (
+            len(current)
+            + len(word)
+            + 1
+            <= max_chars
+        ):
 
-            current += " " + word
+            current += (
+                " " + word
+            )
 
         else:
 
@@ -1326,7 +1376,7 @@ def wrap_text(
 
 
 # ============================================================
-# СОЗДАНИЕ ИНФОРМАЦИОННОЙ СТРАНИЦЫ
+# ИНФОРМАЦИОННАЯ СТРАНИЦА
 # ============================================================
 
 def create_info_label(
@@ -1335,10 +1385,6 @@ def create_info_label(
     name,
     qty
 ):
-    """
-    Создаёт PDF-страницу A4
-    с информацией по товару.
-    """
 
     buffer = io.BytesIO()
 
@@ -1349,9 +1395,9 @@ def create_info_label(
 
     width, height = A4
 
-    # --------------------------------------------------------
+    # ========================================================
     # Заголовок
-    # --------------------------------------------------------
+    # ========================================================
 
     c.setFont(
         FONT,
@@ -1364,13 +1410,13 @@ def create_info_label(
         "ЛИСТ ПОДБОРА"
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Номер отправления
-    # --------------------------------------------------------
+    # ========================================================
 
     c.setFont(
         FONT,
-        15
+        14
     )
 
     c.drawString(
@@ -1387,16 +1433,18 @@ def create_info_label(
     c.drawString(
         50,
         height - 145,
-        str(order or "-")
+        str(
+            order or "-"
+        )
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Артикул
-    # --------------------------------------------------------
+    # ========================================================
 
     c.setFont(
         FONT,
-        15
+        14
     )
 
     c.drawString(
@@ -1413,16 +1461,18 @@ def create_info_label(
     c.drawString(
         50,
         height - 235,
-        str(article or "-")
+        str(
+            article or "-"
+        )
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Количество
-    # --------------------------------------------------------
+    # ========================================================
 
     c.setFont(
         FONT,
-        15
+        14
     )
 
     c.drawString(
@@ -1439,16 +1489,18 @@ def create_info_label(
     c.drawString(
         50,
         height - 330,
-        str(qty or 1)
+        str(
+            qty or 1
+        )
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Товар
-    # --------------------------------------------------------
+    # ========================================================
 
     c.setFont(
         FONT,
-        15
+        14
     )
 
     c.drawString(
@@ -1457,30 +1509,29 @@ def create_info_label(
         "Товар:"
     )
 
-    # Размер шрифта
-    name_font_size = 20
+    name = name or "Товар"
 
-    name_lines = wrap_text(
-        name or "Товар",
-        45
+    lines = wrap_text(
+        name,
+        42
     )
 
-    # Если название очень длинное —
-    # уменьшаем шрифт.
-    if len(name_lines) > 5:
-        name_font_size = 16
+    font_size = 20
 
-    elif len(name_lines) > 3:
-        name_font_size = 18
+    if len(lines) > 4:
+        font_size = 18
+
+    if len(lines) > 6:
+        font_size = 16
 
     c.setFont(
         FONT,
-        name_font_size
+        font_size
     )
 
     y = height - 430
 
-    for line in name_lines[:8]:
+    for line in lines[:8]:
 
         c.drawString(
             50,
@@ -1489,15 +1540,15 @@ def create_info_label(
         )
 
         y -= (
-            name_font_size + 8
+            font_size + 8
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Рамка
-    # --------------------------------------------------------
+    # ========================================================
 
     c.setLineWidth(
-        1.5
+        1
     )
 
     c.rect(
@@ -1515,159 +1566,165 @@ def create_info_label(
 
 
 # ============================================================
-# ЧТЕНИЕ ЭТИКЕТОК
+# ОБРАБОТКА ЭТИКЕТОК
 # ============================================================
 
 def process_labels(
     labels_file,
-    items
+    index
 ):
-    """
-    Добавляет после каждой страницы этикетки
-    информационную страницу.
-    """
 
-    try:
-        labels_file.seek(0)
+    labels_file.seek(0)
 
-        labels_bytes = labels_file.read()
+    data = labels_file.read()
 
-        reader = PdfReader(
-            io.BytesIO(labels_bytes)
+    reader = PdfReader(
+        io.BytesIO(data)
+    )
+
+    writer = PdfWriter()
+
+    total = len(
+        reader.pages
+    )
+
+    progress = st.progress(
+        0,
+        text="Обрабатываем этикетки..."
+    )
+
+    found = 0
+    not_found = 0
+
+    not_found_data = []
+
+    for page_number, page in enumerate(
+        reader.pages,
+        start=1
+    ):
+
+        # ====================================================
+        # 1. ОРИГИНАЛЬНАЯ ЭТИКЕТКА
+        #
+        # НИКАК НЕ МЕНЯЕМ ЕЁ.
+        # ====================================================
+
+        writer.add_page(
+            page
         )
 
-        writer = PdfWriter()
+        # ====================================================
+        # 2. Извлекаем номер/код
+        # ====================================================
 
-        total = len(
-            reader.pages
+        identifiers = extract_label_identifiers(
+            page
         )
 
-        progress = st.progress(
-            0,
-            text="Обрабатываем этикетки..."
+        order = identifiers[
+            "order"
+        ]
+
+        short_code = identifiers[
+            "short_code"
+        ]
+
+        # ====================================================
+        # 3. Ищем товар
+        # ====================================================
+
+        item = find_item_for_label(
+            order,
+            short_code,
+            index
         )
 
-        found_count = 0
-        not_found_count = 0
+        # ====================================================
+        # 4. Создаём дополнительную страницу
+        # ====================================================
 
-        not_found_orders = []
+        if item:
 
-        for index, page in enumerate(
-            reader.pages
-        ):
+            found += 1
 
-            # ------------------------------------------------
-            # Добавляем оригинальную этикетку
-            # ------------------------------------------------
-
-            writer.add_page(
-                page
-            )
-
-            # ------------------------------------------------
-            # Ищем номер отправления
-            # ------------------------------------------------
-
-            order = extract_order_from_label(
-                page
-            )
-
-            # ------------------------------------------------
-            # Ищем товар
-            # ------------------------------------------------
-
-            item = find_item_for_order(
-                order,
-                items
-            )
-
-            if item:
-
-                found_count += 1
-
-                info_pdf = create_info_label(
-                    order=order,
-                    article=item.get(
-                        "article",
-                        "-"
-                    ),
-                    name=item.get(
-                        "name",
-                        "Товар"
-                    ),
-                    qty=item.get(
-                        "qty",
-                        1
-                    )
-                )
-
-            else:
-
-                not_found_count += 1
-
-                if order:
-                    not_found_orders.append(
-                        order
-                    )
-
-                info_pdf = create_info_label(
-                    order=order or "Не найден",
-                    article="-",
-                    name="Товар не найден в листе подбора",
-                    qty=1
-                )
-
-            # ------------------------------------------------
-            # Добавляем информационную страницу
-            # ------------------------------------------------
-
-            info_reader = PdfReader(
-                info_pdf
-            )
-
-            writer.add_page(
-                info_reader.pages[0]
-            )
-
-            progress.progress(
-                (index + 1) / total,
-                text=(
-                    f"Этикетка "
-                    f"{index + 1}/{total}"
+            info_pdf = create_info_label(
+                order=item.get(
+                    "order",
+                    order or "-"
+                ),
+                article=item.get(
+                    "article",
+                    "-"
+                ),
+                name=item.get(
+                    "name",
+                    "Товар"
+                ),
+                qty=item.get(
+                    "qty",
+                    1
                 )
             )
 
-        progress.empty()
+        else:
 
-        output = io.BytesIO()
+            not_found += 1
 
-        writer.write(
-            output
+            not_found_data.append({
+                "page": page_number,
+                "order": order,
+                "short_code": short_code
+            })
+
+            info_pdf = create_info_label(
+                order=order or (
+                    short_code or
+                    "Не найден"
+                ),
+                article="-",
+                name="Товар не найден",
+                qty=1
+            )
+
+        # ====================================================
+        # 5. Добавляем инфо-страницу
+        # ====================================================
+
+        info_reader = PdfReader(
+            info_pdf
         )
 
-        output.seek(0)
-
-        return (
-            output,
-            found_count,
-            not_found_count,
-            not_found_orders
+        writer.add_page(
+            info_reader.pages[0]
         )
 
-    except Exception as e:
-
-        st.error(
-            "Ошибка при обработке этикеток."
+        progress.progress(
+            page_number / max(
+                total,
+                1
+            ),
+            text=(
+                f"Этикетки: "
+                f"{page_number}/{total}"
+            )
         )
 
-        st.exception(e)
+    progress.empty()
 
-        return (
-            None,
-            0,
-            0,
-            []
-        )
+    output = io.BytesIO()
+
+    writer.write(
+        output
+    )
+
+    output.seek(0)
+
+    return (
+        output,
+        found,
+        not_found,
+        not_found_data
+    )
 
 
 # ============================================================
@@ -1679,22 +1736,22 @@ st.divider()
 labels_file = st.file_uploader(
     "1️⃣ PDF с этикетками Ozon",
     type=["pdf"],
-    key="labels_pdf"
+    key="labels"
 )
 
 assembly_file = st.file_uploader(
     "2️⃣ PDF с листом подбора Ozon",
     type=["pdf"],
-    key="assembly_pdf"
+    key="assembly"
 )
 
 
 # ============================================================
-# КНОПКА
+# ЗАПУСК
 # ============================================================
 
 if st.button(
-    "🚀 Сформировать готовый PDF",
+    "🔥 Сформировать готовый PDF",
     type="primary",
     use_container_width=True
 ):
@@ -1702,7 +1759,7 @@ if st.button(
     if not labels_file:
 
         st.error(
-            "Сначала загрузите PDF с этикетками."
+            "Загрузите PDF с этикетками."
         )
 
         st.stop()
@@ -1710,76 +1767,76 @@ if st.button(
     if not assembly_file:
 
         st.error(
-            "Сначала загрузите PDF с листом подбора."
+            "Загрузите PDF с листом подбора."
         )
 
         st.stop()
 
-    # --------------------------------------------------------
+    # ========================================================
     # Читаем лист подбора
-    # --------------------------------------------------------
+    # ========================================================
 
     with st.spinner(
-        "🔎 Читаем лист подбора..."
+        "📋 Читаем лист подбора..."
     ):
 
-        items = parse_assembly_list(
+        index = parse_assembly_list(
             assembly_file
         )
 
-    if not items:
-
-        st.error(
-            "Не удалось найти товары в листе подбора."
-        )
-
-        st.warning(
-            "Проверьте, что это PDF именно с листом подбора Ozon."
-        )
-
-        st.stop()
-
     # --------------------------------------------------------
-    # Убираем технические ключи для статистики
+    # Считаем уникальные отправления
     # --------------------------------------------------------
 
     unique_orders = set()
 
-    for key, item in items.items():
+    for key, item in index.items():
 
         if key.startswith(
-            ("NUM_", "LAST10_")
+            (
+                "ORDER_",
+                "NUM_",
+                "LAST10_",
+                "SHORT_"
+            )
         ):
-            continue
 
-        order = item.get(
-            "order"
-        )
-
-        if order:
-            unique_orders.add(
-                order
+            order = item.get(
+                "order"
             )
 
+            if order:
+                unique_orders.add(
+                    order
+                )
+
+    if not unique_orders:
+
+        st.error(
+            "❌ В листе подбора не найдено ни одного отправления."
+        )
+
+        st.stop()
+
     st.success(
-        f"Найдено отправлений в листе подбора: "
-        f"{len(unique_orders)}"
+        f"📋 В листе подбора найдено "
+        f"{len(unique_orders)} отправлений."
     )
 
-    # --------------------------------------------------------
-    # Показываем небольшую диагностику
-    # --------------------------------------------------------
+    # ========================================================
+    # ПРОВЕРКА РАСПОЗНАННЫХ ДАННЫХ
+    # ========================================================
 
     with st.expander(
-        "🔎 Проверить найденные товары"
+        "🔎 Проверить распознанные товары"
     ):
 
-        shown = set()
+        displayed = set()
 
-        for key, item in items.items():
+        for key, item in index.items():
 
-            if key.startswith(
-                ("NUM_", "LAST10_")
+            if not key.startswith(
+                "SHORT_"
             ):
                 continue
 
@@ -1788,104 +1845,111 @@ if st.button(
                 ""
             )
 
-            if order in shown:
+            if order in displayed:
                 continue
 
-            shown.add(
+            displayed.add(
                 order
             )
 
             st.write(
-                {
-                    "Отправление": order,
-                    "Артикул": item.get(
-                        "article",
-                        "-"
-                    ),
-                    "Товар": item.get(
-                        "name",
-                        "Товар"
-                    ),
-                    "Количество": item.get(
-                        "qty",
-                        1
-                    ),
-                    "Код": get_short_code(
-                        order
-                    )
-                }
+                f"**{order}**  "
+                f"| Код: `{get_short_code(order)}`  "
+                f"| Артикул: `{item.get('article', '-')}`  "
+                f"| Кол-во: `{item.get('qty', 1)}`"
             )
 
-    # --------------------------------------------------------
-    # Формируем результат
-    # --------------------------------------------------------
+            st.caption(
+                item.get(
+                    "name",
+                    "Товар"
+                )
+            )
+
+    # ========================================================
+    # ОБРАБАТЫВАЕМ ЭТИКЕТКИ
+    # ========================================================
 
     with st.spinner(
-        "🖨️ Формируем готовые этикетки..."
+        "🖨️ Склеиваем этикетки..."
     ):
 
         result = process_labels(
             labels_file,
-            items
+            index
         )
 
     output = result[0]
+    found = result[1]
+    not_found = result[2]
+    not_found_data = result[3]
 
     if output is None:
+
+        st.error(
+            "Не удалось сформировать PDF."
+        )
+
         st.stop()
 
-    found_count = result[1]
-    not_found_count = result[2]
-    not_found_orders = result[3]
-
-    # --------------------------------------------------------
-    # Статистика
-    # --------------------------------------------------------
+    # ========================================================
+    # СТАТИСТИКА
+    # ========================================================
 
     st.divider()
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3 = st.columns(
+        3
+    )
 
     with col1:
+
         st.metric(
-            "Этикеток",
-            found_count + not_found_count
+            "Всего этикеток",
+            found + not_found
         )
 
     with col2:
+
         st.metric(
             "Найдено",
-            found_count
+            found
         )
 
     with col3:
+
         st.metric(
             "Не найдено",
-            not_found_count
+            not_found
         )
 
-    # --------------------------------------------------------
-    # Ненайденные отправления
-    # --------------------------------------------------------
+    # ========================================================
+    # ЕСЛИ ЧТО-ТО НЕ НАШЛОСЬ
+    # ========================================================
 
-    if not_found_orders:
+    if not_found_data:
 
         with st.expander(
-            "⚠️ Отправления, для которых не найден товар"
+            "⚠️ Что не сопоставилось"
         ):
 
-            for order in not_found_orders:
+            for row in not_found_data:
 
-                st.code(
-                    order
+                st.write(
+                    f"Страница **{row['page']}** | "
+                    f"Отправление: "
+                    f"`{row['order'] or '-'}` | "
+                    f"Код: "
+                    f"`{row['short_code'] or '-'}`"
                 )
 
-    # --------------------------------------------------------
-    # Скачать
-    # --------------------------------------------------------
+    # ========================================================
+    # СКАЧИВАНИЕ
+    # ========================================================
 
     st.success(
-        "✅ PDF успешно сформирован!"
+        f"✅ Готово. Найдено {found} из "
+        f"{found + not_found} этикеток."
     )
 
     st.download_button(
@@ -1895,4 +1959,4 @@ if st.button(
         mime="application/pdf",
         use_container_width=True
     )
-    
+

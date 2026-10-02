@@ -1228,7 +1228,7 @@ def create_info_page(
 
         c.setFont(
             FONT_NAME,
-            8.5
+            16
         )
 
         c.drawString(

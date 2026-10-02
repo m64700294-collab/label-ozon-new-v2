@@ -16,16 +16,17 @@ import requests
 # ============================================================
 
 st.set_page_config(
-    page_title="Ozon — Этикетки + Лист подбора",
+    page_title="Ozon — Этап 1 — Этикетки",
     page_icon="🖨️",
     layout="wide"
 )
 
-st.title("🖨️ Ozon — Этикетки + Лист подбора")
+st.title("🖨️ Ozon — Этап 1 — Этикетки + данные API")
 
 st.write(
-    "Артикул и количество берутся из выгрузки Ozon API. "
-    "PDF используется только для определения номера отправления."
+    "На этом этапе программа сопоставляет обычные этикетки "
+    "с выгрузкой Ozon API. Новые этикетки вида "
+    "`II5010320 2549` сохраняются для второго этапа."
 )
 
 
@@ -97,14 +98,12 @@ def normalize_order(order):
     if not value:
         return ""
 
-    # Убираем невидимые символы
     value = (
         value
         .replace("\u200b", "")
         .replace("\xa0", " ")
     )
 
-    # Приводим разные виды тире к обычному
     value = (
         value
         .replace("–", "-")
@@ -112,41 +111,18 @@ def normalize_order(order):
         .replace("−", "-")
     )
 
-    # Убираем пробелы вокруг дефисов
     value = re.sub(
         r"\s*-\s*",
         "-",
         value
     )
 
-    # В Ozon номер обычно цифровой
-    value = value.lower()
+    return value.lower()
 
-    return value
-
-
-# ============================================================
-# НОРМАЛИЗАЦИЯ НОМЕРА ДЛЯ НАДЕЖНОГО СРАВНЕНИЯ
-# ============================================================
 
 def order_key(order):
 
-    """
-    Создает несколько вариантов ключа.
-
-    Основной:
-        34965873-0195-1
-
-    Дополнительный:
-        3496587301951
-    """
-
-    value = normalize_order(order)
-
-    if not value:
-        return ""
-
-    return value
+    return normalize_order(order)
 
 
 def numeric_order_key(order):
@@ -161,7 +137,7 @@ def numeric_order_key(order):
 
 
 # ============================================================
-# ПОИСК НОМЕРА ОТПРАВЛЕНИЯ В ТЕКСТЕ PDF
+# ПОИСК НОМЕРА ОТПРАВЛЕНИЯ
 # ============================================================
 
 ORDER_PATTERN = re.compile(
@@ -184,6 +160,7 @@ def find_orders(text):
         value = normalize_order(value)
 
         if value and value not in result:
+
             result.append(value)
 
     return result
@@ -194,16 +171,6 @@ def find_orders(text):
 # ============================================================
 
 def find_order_by_numeric_text(text):
-
-    """
-    Резервный способ.
-
-    Иногда PDF может вернуть номер без дефисов:
-
-        3496587301951
-
-    Тогда пытаемся найти последовательность цифр.
-    """
 
     if not text:
         return []
@@ -216,8 +183,6 @@ def find_order_by_numeric_text(text):
 
     result = []
 
-    # Обычно номер Ozon содержит 15 цифр.
-    # Проверяем возможные окна.
     for length in [15, 14, 13, 12]:
 
         if len(clean) < length:
@@ -233,13 +198,14 @@ def find_order_by_numeric_text(text):
             ]
 
             if candidate not in result:
+
                 result.append(candidate)
 
     return result
 
 
 # ============================================================
-# ПОИСК КОЛОНОК В EXCEL / CSV
+# ПОИСК КОЛОНОК
 # ============================================================
 
 def normalize_column_name(name):
@@ -274,7 +240,6 @@ def find_column(columns, variants):
             normalize_column_name(column)
         ] = column
 
-    # Сначала точное совпадение
     for variant in variants:
 
         v = normalize_column_name(
@@ -282,9 +247,9 @@ def find_column(columns, variants):
         )
 
         if v in normalized:
+
             return normalized[v]
 
-    # Затем частичное
     for column in columns:
 
         c = normalize_column_name(
@@ -329,7 +294,6 @@ def read_xlsx(file):
         data_only=True
     )
 
-    # Берем первый лист
     sheet = workbook[
         workbook.sheetnames[0]
     ]
@@ -339,8 +303,11 @@ def read_xlsx(file):
     )
 
     try:
+
         headers = next(rows)
+
     except StopIteration:
+
         return []
 
     headers = [
@@ -395,7 +362,6 @@ def read_csv_file(file):
 
     raw = file.read()
 
-    # Пробуем UTF-8
     try:
 
         text = raw.decode(
@@ -409,7 +375,6 @@ def read_csv_file(file):
             errors="replace"
         )
 
-    # Определяем разделитель
     sample = text[:5000]
 
     try:
@@ -467,15 +432,11 @@ def load_product_table(file):
 
     name = file.name.lower()
 
-    if name.endswith(
-        ".xlsx"
-    ):
+    if name.endswith(".xlsx"):
 
         rows = read_xlsx(file)
 
-    elif name.endswith(
-        ".csv"
-    ):
+    elif name.endswith(".csv"):
 
         rows = read_csv_file(file)
 
@@ -495,12 +456,13 @@ def load_product_table(file):
 
 
 # ============================================================
-# СОЗДАНИЕ ИНДЕКСА ПО ОТПРАВЛЕНИЯМ
+# ИНДЕКС ОТПРАВЛЕНИЙ
 # ============================================================
 
 def build_order_index(rows):
 
     if not rows:
+
         return {}, {}, None
 
     columns = list(
@@ -511,7 +473,6 @@ def build_order_index(rows):
         columns,
         [
             "Номер отправления",
-            "номер отправления",
             "posting number",
             "posting_number",
             "Номер отправления Ozon",
@@ -575,24 +536,14 @@ def build_order_index(rows):
 
         raise Exception(
             "Не найдена колонка "
-            "'Артикул продавца'.\n\n"
-            "Найденные колонки:\n" +
-            "\n".join(
-                str(x)
-                for x in columns
-            )
+            "'Артикул продавца'."
         )
 
     if not qty_column:
 
         raise Exception(
             "Не найдена колонка "
-            "'Количество'.\n\n"
-            "Найденные колонки:\n" +
-            "\n".join(
-                str(x)
-                for x in columns
-            )
+            "'Количество'."
         )
 
     index = {}
@@ -603,76 +554,50 @@ def build_order_index(rows):
 
     for row in rows:
 
-        order = row.get(
-            order_column,
-            ""
-        )
-
         order = normalize_order(
-            order
+            row.get(
+                order_column,
+                ""
+            )
         )
 
         if not order:
             continue
 
-        article = (
-            row.get(
-                article_column,
-                ""
-            )
-            if article_column
-            else ""
-        )
-
-        name = (
-            row.get(
-                name_column,
-                ""
-            )
-            if name_column
-            else ""
-        )
-
-        qty = (
-            row.get(
-                qty_column,
-                ""
-            )
-            if qty_column
-            else ""
-        )
-
-        sku = (
-            row.get(
-                sku_column,
-                ""
-            )
-            if sku_column
-            else ""
-        )
-
         item = {
+
             "order": order,
+
             "article": str(
-                article
+                row.get(
+                    article_column,
+                    ""
+                )
             ).strip(),
 
             "name": str(
-                name
+                row.get(
+                    name_column,
+                    ""
+                )
             ).strip(),
 
             "qty": str(
-                qty
+                row.get(
+                    qty_column,
+                    ""
+                )
             ).strip(),
 
             "sku": str(
-                sku
+                row.get(
+                    sku_column,
+                    ""
+                )
             ).strip()
         }
 
-        key = order_key(
-            order
-        )
+        key = order_key(order)
 
         if key in index:
 
@@ -682,10 +607,8 @@ def build_order_index(rows):
 
         index[key] = item
 
-        numeric_key = (
-            numeric_order_key(
-                order
-            )
+        numeric_key = numeric_order_key(
+            order
         )
 
         if numeric_key:
@@ -712,23 +635,19 @@ def find_product(
 ):
 
     if not order:
+
         return None
 
-    key = order_key(
-        order
-    )
-
     info = order_index.get(
-        key
+        order_key(order)
     )
 
     if info:
+
         return info
 
-    numeric_key = (
-        numeric_order_key(
-            order
-        )
+    numeric_key = numeric_order_key(
+        order
     )
 
     if numeric_key:
@@ -738,69 +657,22 @@ def find_product(
         )
 
         if info:
+
             return info
 
     return None
 
 
 # ============================================================
-# ПЕРЕНОС ТЕКСТА НА ЭТИКЕТКУ
-# ============================================================
-
-def wrap_text(
-    text,
-    max_chars
-):
-
-    if not text:
-        return []
-
-    words = str(text).split()
-
-    lines = []
-
-    current = ""
-
-    for word in words:
-
-        if not current:
-
-            current = word
-
-        elif (
-            len(current) +
-            len(word) +
-            1
-            <= max_chars
-        ):
-
-            current += " " + word
-
-        else:
-
-            lines.append(
-                current
-            )
-
-            current = word
-
-    if current:
-        lines.append(
-            current
-        )
-
-    return lines
-
-
-# ============================================================
-# СОЗДАНИЕ ИНФО-БЛОКА
+# СОЗДАНИЕ ИНФОРМАЦИОННОЙ СТРАНИЦЫ
 # ============================================================
 
 def create_info_label(
     width,
     height,
     order_number,
-    product_info
+    product_info,
+    unresolved=False
 ):
 
     packet = BytesIO()
@@ -815,9 +687,56 @@ def create_info_label(
 
     x_margin = 10
 
-    # --------------------------------------------------------
-    # Номер отправления
-    # --------------------------------------------------------
+    # ========================================================
+    # НЕ РАСПОЗНАННАЯ ЭТИКЕТКА
+    # ========================================================
+
+    if unresolved:
+
+        c.setFont(
+            font_name,
+            10
+        )
+
+        c.drawString(
+            x_margin,
+            height - 20,
+            "Заказ: НЕ РАСПОЗНАН"
+        )
+
+        c.setFont(
+            font_name,
+            13
+        )
+
+        c.drawString(
+            x_margin,
+            height - 42,
+            "Арт: -"
+        )
+
+        c.setFont(
+            font_name,
+            24
+        )
+
+        c.drawString(
+            x_margin,
+            18,
+            "КОЛ-ВО: ?"
+        )
+
+        c.save()
+
+        packet.seek(0)
+
+        return PdfReader(
+            packet
+        ).pages[0]
+
+    # ========================================================
+    # ОБЫЧНАЯ ЭТИКЕТКА
+    # ========================================================
 
     c.setFont(
         font_name,
@@ -837,9 +756,9 @@ def create_info_label(
         height - 20
     )
 
-    # --------------------------------------------------------
-    # Артикул
-    # --------------------------------------------------------
+    # ========================================================
+    # АРТИКУЛ
+    # ========================================================
 
     article = str(
         product_info.get(
@@ -866,9 +785,9 @@ def create_info_label(
         f"Арт: {article}"
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # SKU
-    # --------------------------------------------------------
+    # ========================================================
 
     sku = str(
         product_info.get(
@@ -890,9 +809,9 @@ def create_info_label(
             f"SKU: {sku}"
         )
 
-    # --------------------------------------------------------
-    # Название товара
-    # --------------------------------------------------------
+    # ========================================================
+    # НАЗВАНИЕ
+    # ========================================================
 
     name = str(
         product_info.get(
@@ -901,9 +820,7 @@ def create_info_label(
         )
     )
 
-    top_limit = (
-        height - 61
-    )
+    top_limit = height - 61
 
     bottom_limit = 55
 
@@ -916,10 +833,40 @@ def create_info_label(
 
     line_height = 11
 
-    lines = wrap_text(
-        name,
-        38
-    )
+    words = name.split()
+
+    lines = []
+
+    current = ""
+
+    for word in words:
+
+        if not current:
+
+            current = word
+
+        elif (
+            len(current)
+            + len(word)
+            + 1
+            <= 38
+        ):
+
+            current += " " + word
+
+        else:
+
+            lines.append(
+                current
+            )
+
+            current = word
+
+    if current:
+
+        lines.append(
+            current
+        )
 
     while (
         len(lines) * line_height
@@ -928,17 +875,46 @@ def create_info_label(
     ):
 
         font_size -= 0.5
+
         line_height -= 0.5
 
-        chars = int(
+        max_chars = int(
             38 *
             (9 / font_size)
         )
 
-        lines = wrap_text(
-            name,
-            chars
-        )
+        lines = []
+
+        current = ""
+
+        for word in name.split():
+
+            if not current:
+
+                current = word
+
+            elif (
+                len(current)
+                + len(word)
+                + 1
+                <= max_chars
+            ):
+
+                current += " " + word
+
+            else:
+
+                lines.append(
+                    current
+                )
+
+                current = word
+
+        if current:
+
+            lines.append(
+                current
+            )
 
     c.setFont(
         font_name,
@@ -950,6 +926,7 @@ def create_info_label(
     for line in lines:
 
         if y <= bottom_limit:
+
             break
 
         c.drawString(
@@ -960,9 +937,9 @@ def create_info_label(
 
         y -= line_height
 
-    # --------------------------------------------------------
+    # ========================================================
     # КОЛИЧЕСТВО
-    # --------------------------------------------------------
+    # ========================================================
 
     qty = str(
         product_info.get(
@@ -986,15 +963,13 @@ def create_info_label(
 
     packet.seek(0)
 
-    from pypdf import PdfReader
-
     return PdfReader(
         packet
     ).pages[0]
 
 
 # ============================================================
-# ОСНОВНОЙ ИНТЕРФЕЙС
+# ИНТЕРФЕЙС
 # ============================================================
 
 st.divider()
@@ -1004,20 +979,20 @@ col1, col2 = st.columns(2)
 with col1:
 
     labels_file = st.file_uploader(
-        "1️⃣ Этикетки Ozon PDF",
+        "1️⃣ PDF этикеток Ozon",
         type=["pdf"]
     )
 
 with col2:
 
     table_file = st.file_uploader(
-        "2️⃣ Лист подбора Ozon API",
+        "2️⃣ Выгрузка Ozon API",
         type=["xlsx", "csv"]
     )
 
 
 # ============================================================
-# ПРЕДПРОСМОТР ТАБЛИЦЫ
+# ЧТЕНИЕ ТАБЛИЦЫ
 # ============================================================
 
 table_rows = None
@@ -1036,7 +1011,7 @@ if table_file:
         )
 
         with st.expander(
-            "🔎 Предпросмотр листа подбора"
+            "🔎 Предпросмотр"
         ):
 
             st.dataframe(
@@ -1054,7 +1029,7 @@ if table_file:
 
 
 # ============================================================
-# КНОПКА ОБРАБОТКИ
+# ОБРАБОТКА
 # ============================================================
 
 if (
@@ -1064,16 +1039,12 @@ if (
 ):
 
     if st.button(
-        "🚀 СОЗДАТЬ ГОТОВЫЙ PDF",
+        "🚀 ЭТАП 1 — СОЗДАТЬ PDF",
         type="primary",
         use_container_width=True
     ):
 
         try:
-
-            # ------------------------------------------------
-            # Создаем индекс таблицы
-            # ------------------------------------------------
 
             (
                 order_index,
@@ -1082,23 +1053,6 @@ if (
             ) = build_order_index(
                 table_rows
             )
-
-            st.info(
-                f"🔑 В индексе отправлений: "
-                f"{len(order_index)}"
-            )
-
-            if duplicate_orders:
-
-                st.warning(
-                    "⚠️ В таблице обнаружены "
-                    f"дублирующиеся номера отправлений: "
-                    f"{len(duplicate_orders)}"
-                )
-
-            # ------------------------------------------------
-            # Читаем PDF
-            # ------------------------------------------------
 
             labels_file.seek(0)
 
@@ -1113,37 +1067,35 @@ if (
             )
 
             success_count = 0
+            unresolved_count = 0
 
-            error_orders = []
+            unresolved_pages = []
 
-            progress = st.progress(
-                0
-            )
+            progress = st.progress(0)
 
             status = st.empty()
 
-            # ------------------------------------------------
-            # Обрабатываем страницы
-            # ------------------------------------------------
+            # =================================================
+            # СТРАНИЦЫ
+            # =================================================
 
             for i, page in enumerate(
                 reader.pages
             ):
 
                 status.text(
-                    f"🏷 Обработка этикетки "
+                    f"🏷 Этикетка "
                     f"{i + 1} / "
                     f"{total_labels}"
                 )
 
-                # Оригинальная страница
+                # -------------------------------------------------
+                # САМА Ozon-ЭТИКЕТКА
+                # -------------------------------------------------
+
                 writer.add_page(
                     page
                 )
-
-                # ------------------------------------------------
-                # Извлекаем текст
-                # ------------------------------------------------
 
                 try:
 
@@ -1156,9 +1108,9 @@ if (
 
                     text = ""
 
-                # ------------------------------------------------
-                # Ищем полный номер
-                # ------------------------------------------------
+                # -------------------------------------------------
+                # ИЩЕМ ПОЛНЫЙ НОМЕР
+                # -------------------------------------------------
 
                 orders = find_orders(
                     text
@@ -1170,9 +1122,9 @@ if (
                     else ""
                 )
 
-                # ------------------------------------------------
-                # Если стандартная регулярка не нашла
-                # ------------------------------------------------
+                # -------------------------------------------------
+                # РЕЗЕРВНЫЙ ПОИСК
+                # -------------------------------------------------
 
                 if not full_order:
 
@@ -1181,9 +1133,6 @@ if (
                             text
                         )
                     )
-
-                    # Пытаемся сопоставить
-                    # кандидатов с нашей таблицей
 
                     for candidate in (
                         numeric_candidates
@@ -1203,9 +1152,9 @@ if (
 
                             break
 
-                # ------------------------------------------------
-                # Ищем товар
-                # ------------------------------------------------
+                # -------------------------------------------------
+                # ИЩЕМ ТОВАР
+                # -------------------------------------------------
 
                 info = None
 
@@ -1217,61 +1166,60 @@ if (
                         numeric_index
                     )
 
-                # ------------------------------------------------
-                # Если товар не найден
-                # ------------------------------------------------
+                # =================================================
+                # ОБЫЧНАЯ ЭТИКЕТКА
+                # =================================================
 
-                if not info:
-
-                    display_order = (
-                        full_order
-                        if full_order
-                        else "НЕ РАСПОЗНАН"
-                    )
-
-                    info = {
-                        "order": display_order,
-                        "article": "-",
-                        "name": "Товар не найден",
-                        "qty": "?",
-                        "sku": ""
-                    }
-
-                    error_orders.append(
-                        display_order
-                    )
-
-                else:
+                if info:
 
                     success_count += 1
 
-                # ------------------------------------------------
-                # Размер этикетки
-                # ------------------------------------------------
-
-                width = float(
-                    page.mediabox.width
-                )
-
-                height = float(
-                    page.mediabox.height
-                )
-
-                # ------------------------------------------------
-                # Добавляем информацию
-                # ------------------------------------------------
-
-                info_page = (
-                    create_info_label(
-                        width,
-                        height,
-                        info.get(
-                            "order",
-                            full_order
-                        ),
-                        info
+                    info_page = (
+                        create_info_label(
+                            width=float(
+                                page.mediabox.width
+                            ),
+                            height=float(
+                                page.mediabox.height
+                            ),
+                            order_number=info["order"],
+                            product_info=info,
+                            unresolved=False
+                        )
                     )
-                )
+
+                # =================================================
+                # НОВАЯ ЭТИКЕТКА
+                # =================================================
+
+                else:
+
+                    unresolved_count += 1
+
+                    unresolved_pages.append(
+                        {
+                            "page": i + 1,
+                            "text": text[:1000]
+                        }
+                    )
+
+                    info_page = (
+                        create_info_label(
+                            width=float(
+                                page.mediabox.width
+                            ),
+                            height=float(
+                                page.mediabox.height
+                            ),
+                            order_number="",
+                            product_info={},
+                            unresolved=True
+                        )
+                    )
+
+                # -------------------------------------------------
+                # ВТОРАЯ СТРАНИЦА
+                # -------------------------------------------------
 
                 writer.add_page(
                     info_page
@@ -1283,7 +1231,7 @@ if (
                 )
 
             status.text(
-                "✅ Обработка завершена"
+                "✅ Этап 1 завершён"
             )
 
             # ====================================================
@@ -1292,65 +1240,42 @@ if (
 
             st.divider()
 
-            col_m1, col_m2, col_m3 = (
-                st.columns(3)
-            )
+            c1, c2, c3 = st.columns(3)
 
-            col_m1.metric(
+            c1.metric(
                 "Всего этикеток",
                 total_labels
             )
 
-            col_m2.metric(
-                "Сопоставлено",
+            c2.metric(
+                "Найдено в API",
                 success_count
             )
 
-            col_m3.metric(
-                "Ошибок",
-                total_labels -
-                success_count
+            c3.metric(
+                "На второй этап",
+                unresolved_count
             )
 
-            # ====================================================
-            # РЕЗУЛЬТАТ
-            # ====================================================
+            if unresolved_count:
 
-            if (
-                success_count ==
-                total_labels
-            ):
-
-                st.success(
-                    "🎉 Все этикетки "
-                    "сопоставлены с листом подбора!"
+                st.warning(
+                    f"⚠️ {unresolved_count} "
+                    "этикеток не распознаны. "
+                    "Они сохранены в PDF с пометкой "
+                    "'НЕ РАСПОЗНАН' и будут обработаны "
+                    "на втором этапе по PDF листа подбора."
                 )
 
             else:
 
-                st.error(
-                    "⚠️ Не удалось "
-                    f"сопоставить "
-                    f"{total_labels - success_count} "
-                    "этикеток."
+                st.success(
+                    "🎉 Все этикетки распознаны "
+                    "на первом этапе."
                 )
 
-                if error_orders:
-
-                    with st.expander(
-                        "❌ Проблемные отправления"
-                    ):
-
-                        for order in (
-                            error_orders[:200]
-                        ):
-
-                            st.write(
-                                f"• {order}"
-                            )
-
             # ====================================================
-            # СОЗДАЕМ PDF
+            # PDF
             # ====================================================
 
             output = BytesIO()
@@ -1362,13 +1287,38 @@ if (
             output.seek(0)
 
             st.download_button(
-                "📥 Скачать готовый PDF",
+                "📥 Скачать PDF для Этапа 2",
                 output,
-                "Ozon_Ready_Labels.pdf",
+                "Ozon_Etap_1.pdf",
                 "application/pdf",
                 type="primary",
                 use_container_width=True
             )
+
+            # ====================================================
+            # ДИАГНОСТИКА
+            # ====================================================
+
+            if unresolved_pages:
+
+                with st.expander(
+                    "🔎 Что отправлено на Этап 2"
+                ):
+
+                    for item in unresolved_pages:
+
+                        st.write(
+                            f"Страница PDF: "
+                            f"{item['page']}"
+                        )
+
+                        if item["text"]:
+
+                            st.code(
+                                item["text"]
+                            )
+
+                        st.divider()
 
         except Exception as e:
 
@@ -1392,21 +1342,29 @@ if not labels_file or not table_file:
 
     st.info(
         """
-        ### Как использовать
+        ### Этап 1
 
-        **1.** Загрузите PDF с этикетками Ozon.
+        Загрузите:
 
-        **2.** Из Google Таблицы экспортируйте
-        лист `OZON | Лист подбора API` в XLSX:
+        **1.** PDF с этикетками Ozon.
 
-        `Файл → Скачать → Microsoft Excel (.xlsx)`
+        **2.** CSV/XLSX выгрузку Ozon API.
 
-        **3.** Загрузите полученный XLSX сюда.
+        Обычные этикетки вида:
 
-        **4.** Нажмите **«СОЗДАТЬ ГОТОВЫЙ PDF»**.
+        `0126236473-0731-1`
 
-        Артикул и количество берутся непосредственно
-        из данных Ozon API, поэтому программа больше
-        не пытается угадывать их из текста листа подбора.
+        будут сразу сопоставлены.
+
+        Этикетки нового формата:
+
+        `II5010320 2549`
+
+        не удаляются и не пытаются сопоставиться
+        по неправильному номеру.
+
+        Они переходят на **Этап 2**, где номер
+        `2549` будет найден в PDF листа подбора
+        и связан с номером отправления Ozon.
         """
     )

@@ -21,6 +21,9 @@ INFO_LABEL_HEIGHT = 40 * mm
 
 FONT_NAME = "Roboto"
 
+# Размер количества
+QUANTITY_FONT_SIZE = 16
+
 # ============================================================
 # ШРИФТ
 # ============================================================
@@ -111,6 +114,110 @@ def clean_number(value):
     value = value.replace("\xa0", "")
     value = value.replace(" ", "")
     value = value.replace(",", ".")
+
+    return value
+
+
+# ============================================================
+# ОЧИСТКА КОЛИЧЕСТВА
+# ============================================================
+
+def clean_quantity(value):
+    """
+    Возвращает только корректное количество товара.
+
+    Главная задача:
+    не допустить попадания посторонних цифр
+    в поле КОЛ-ВО.
+
+    Допустимые варианты:
+        1
+        2
+        10
+        1.0
+        2,0
+        1 шт
+        2 шт.
+
+    Если значение явно не является количеством,
+    возвращаем исходное очищенное значение.
+    """
+
+    if value is None:
+        return ""
+
+    value = normalize_text(value)
+
+    if not value:
+        return ""
+
+    # --------------------------------------------------------
+    # Если это обычное целое число
+    # --------------------------------------------------------
+
+    match = re.fullmatch(
+        r"(\d+)",
+        value
+    )
+
+    if match:
+        return match.group(1)
+
+    # --------------------------------------------------------
+    # Десятичное значение:
+    # 1.0 / 1,0
+    # --------------------------------------------------------
+
+    match = re.fullmatch(
+        r"(\d+)[.,](\d+)",
+        value
+    )
+
+    if match:
+
+        integer_part = match.group(1)
+        decimal_part = match.group(2)
+
+        # Если 1.0 / 2.00 — показываем как целое
+        if set(decimal_part) <= {"0"}:
+            return integer_part
+
+        return (
+            f"{integer_part}."
+            f"{decimal_part}"
+        )
+
+    # --------------------------------------------------------
+    # Форматы "1 шт", "2 штуки"
+    # --------------------------------------------------------
+
+    match = re.fullmatch(
+        r"(\d+)\s*(?:шт\.?|штук[аи]?|ед\.?)?",
+        value,
+        flags=re.IGNORECASE
+    )
+
+    if match:
+        return match.group(1)
+
+    # --------------------------------------------------------
+    # Иногда Excel отдаёт 1.0 как float
+    # --------------------------------------------------------
+
+    try:
+
+        numeric = float(
+            value.replace(",", ".")
+        )
+
+        if numeric.is_integer():
+
+            return str(
+                int(numeric)
+            )
+
+    except Exception:
+        pass
 
     return value
 
@@ -340,7 +447,7 @@ def build_api_index(df):
         quantity = ""
 
         if quantity_col:
-            quantity = clean_number(
+            quantity = clean_quantity(
                 row.get(quantity_col, "")
             )
 
@@ -596,7 +703,6 @@ def build_old_order_candidates(
         text
     )
 
-    # Уникальные токены
     numeric_tokens = list(
         dict.fromkeys(numeric_tokens)
     )
@@ -641,7 +747,6 @@ def find_old_format_candidates(
 
     result = []
 
-    # Прямой полный номер
     direct = find_direct_order_candidates(
         text,
         api_index
@@ -652,7 +757,6 @@ def find_old_format_candidates(
         if order not in result:
             result.append(order)
 
-    # Конструкция старого формата
     old = build_old_order_candidates(
         text,
         api_index
@@ -669,27 +773,11 @@ def find_old_format_candidates(
 # ============================================================
 # ЛИСТ ПОДБОРА
 #
-# ВАЖНО:
-#
 # Для нового формата индексируем:
 #
 # II5010320 + 2714
 #
 # а НЕ просто 2714.
-#
-# Пример:
-#
-# 232
-# 06393222-0143-75
-# ii50103202714
-# ...
-# 2714
-#
-# =>
-#
-# II5010320|2714
-#       ↓
-# 06393222-0143-75
 # ============================================================
 
 def build_picklist_index(
@@ -720,24 +808,16 @@ def build_picklist_index(
 
         text = normalize_text(text)
 
-        # --------------------------------------------------------
-        # Все номера заказов на странице
-        # --------------------------------------------------------
-
         orders = list(
             order_re.finditer(text)
         )
-
-        # --------------------------------------------------------
-        # Все новые этикетки
-        # --------------------------------------------------------
 
         new_labels = list(
             new_label_re.finditer(text)
         )
 
         # --------------------------------------------------------
-        # Старые / обычные номера
+        # Все номера заказов на странице
         # --------------------------------------------------------
 
         for match in orders:
@@ -758,7 +838,7 @@ def build_picklist_index(
             )
 
         # --------------------------------------------------------
-        # Новые номера
+        # Новые II-этикетки
         # --------------------------------------------------------
 
         for nm in new_labels:
@@ -775,8 +855,10 @@ def build_picklist_index(
                 f"{internal_code}|{short_key}"
             )
 
-            # Все номера заказов,
-            # которые находятся ДО новой этикетки
+            # ----------------------------------------------------
+            # Все номера заказов ДО II
+            # ----------------------------------------------------
+
             previous_orders = [
                 om for om in orders
                 if om.start() < nm.start()
@@ -796,8 +878,11 @@ def build_picklist_index(
             if not order:
                 continue
 
-            # Проверяем, нет ли другого заказа
-            # между найденным номером и новой этикеткой.
+            # ----------------------------------------------------
+            # Между номером и II не должно быть
+            # другого номера заказа
+            # ----------------------------------------------------
+
             distance_text = text[
                 nearest_order_match.end():
                 nm.start()
@@ -816,26 +901,45 @@ def build_picklist_index(
                 "short_key": short_key,
             }
 
-            # Если пара уже существует и указывает
-            # на другой заказ — помечаем как неоднозначную.
+            # ----------------------------------------------------
+            # Проверка конфликта
+            # ----------------------------------------------------
+
             if pair_key in index["new_labels"]:
 
                 old_data = index[
                     "new_labels"
                 ][pair_key]
 
-                if old_data.get("order") != order:
+                old_order = old_data.get(
+                    "order"
+                )
+
+                if (
+                    not old_data.get("ambiguous")
+                    and old_order != order
+                ):
+
+                    orders_list = []
+
+                    if old_order:
+                        orders_list.append(
+                            old_order
+                        )
+
+                    orders_list.append(
+                        order
+                    )
 
                     index["new_labels"][
                         pair_key
                     ] = {
                         "ambiguous": True,
-                        "orders": [
-                            old_data.get(
-                                "order"
-                            ),
-                            order,
-                        ],
+                        "orders": list(
+                            dict.fromkeys(
+                                orders_list
+                            )
+                        ),
                         "page": page_num,
                         "text": text,
                         "internal_code":
@@ -843,6 +947,25 @@ def build_picklist_index(
                         "short_key":
                             short_key,
                     }
+
+                elif old_data.get(
+                    "ambiguous"
+                ):
+
+                    old_orders = old_data.get(
+                        "orders",
+                        []
+                    )
+
+                    if order not in old_orders:
+
+                        old_orders.append(
+                            order
+                        )
+
+                        old_data[
+                            "orders"
+                        ] = old_orders
 
                 continue
 
@@ -856,9 +979,7 @@ def build_picklist_index(
 # ============================================================
 # FALLBACK ПО ЛИСТУ ПОДБОРА
 #
-# Используется ТОЛЬКО для старого формата.
-#
-# Для нового формата fallback по номеру заказа запрещён.
+# Для нового формата fallback запрещён.
 # ============================================================
 
 def picklist_fallback(
@@ -902,10 +1023,6 @@ def picklist_fallback(
             "source": "Старый формат",
         }
 
-    # --------------------------------------------------------
-    # НИКАКОГО поиска new_key внутри номера заказа здесь нет.
-    # --------------------------------------------------------
-
     return None
 
 
@@ -920,12 +1037,15 @@ def resolve_page(
 ):
 
     if not text:
+
         return {
             "type": "Не распознано",
             "key": "",
             "order": "",
             "api": None,
             "source": "",
+            "internal_code": "",
+            "short_key": "",
         }
 
     text_normalized = normalize_text(
@@ -951,6 +1071,8 @@ def resolve_page(
             "order": order,
             "api": api_index.get(order),
             "source": "PDF",
+            "internal_code": "",
+            "short_key": "",
         }
 
     # ========================================================
@@ -972,28 +1094,32 @@ def resolve_page(
             "order": order,
             "api": api_index.get(order),
             "source": "PDF",
+            "internal_code": "",
+            "short_key": "",
         }
 
     # ========================================================
-    # 3. НОВЫЙ ФОРМАТ
+    # 3. НОВЫЙ ФОРМАТ II
     #
-    # Примеры:
+    # Например:
     #
     # II5010320 2714
     #
-    # ii50103202714
+    # или:
     #
-    # КРИТИЧЕСКИ ВАЖНО:
+    # II50103202714
     #
-    # 2714 НИКОГДА НЕ ИЩЕМ В НОМЕРЕ ЗАКАЗА.
+    # ВАЖНО:
+    #
+    # 2714 НЕ ИЩЕМ В НОМЕРЕ ЗАКАЗА.
     #
     # Только:
     #
     # II5010320|2714
-    #       ↓
+    #        ↓
     # Лист подбора
-    #       ↓
-    # 06393222-0143-75
+    #        ↓
+    # Номер отправления
     # ========================================================
 
     new_label_matches = re.findall(
@@ -1024,10 +1150,6 @@ def resolve_page(
             f"{internal_code}|{short_key}"
         )
 
-        # ----------------------------------------------------
-        # Только Лист подбора
-        # ----------------------------------------------------
-
         pick_data = None
 
         if picklist_index:
@@ -1038,7 +1160,7 @@ def resolve_page(
             ).get(pair_key)
 
         # ----------------------------------------------------
-        # Найдено несколько разных заказов
+        # КОНФЛИКТ
         # ----------------------------------------------------
 
         if pick_data and pick_data.get(
@@ -1051,11 +1173,20 @@ def resolve_page(
                 "order": "",
                 "api": None,
                 "source":
-                    "Лист подбора: неоднозначно",
+                    "Лист подбора: НЕОДНОЗНАЧНО",
+                "internal_code":
+                    internal_code,
+                "short_key":
+                    short_key,
+                "conflict_orders":
+                    pick_data.get(
+                        "orders",
+                        []
+                    ),
             }
 
         # ----------------------------------------------------
-        # Найдено однозначно
+        # НАЙДЕН ОДНОЗНАЧНО
         # ----------------------------------------------------
 
         if pick_data:
@@ -1086,6 +1217,10 @@ def resolve_page(
                             api_data,
                         "source":
                             "Лист подбора",
+                        "internal_code":
+                            internal_code,
+                        "short_key":
+                            short_key,
                     }
 
                 return {
@@ -1099,12 +1234,14 @@ def resolve_page(
                         None,
                     "source":
                         "Лист подбора, нет в API",
+                    "internal_code":
+                        internal_code,
+                    "short_key":
+                        short_key,
                 }
 
         # ----------------------------------------------------
-        # Ничего не нашли.
-        #
-        # НЕ УГАДЫВАЕМ.
+        # НЕ УГАДЫВАЕМ
         # ----------------------------------------------------
 
         return {
@@ -1113,6 +1250,10 @@ def resolve_page(
             "order": "",
             "api": None,
             "source": "",
+            "internal_code":
+                internal_code,
+            "short_key":
+                short_key,
         }
 
     # ========================================================
@@ -1133,6 +1274,8 @@ def resolve_page(
             "order": fallback["order"],
             "api": fallback["api"],
             "source": fallback["source"],
+            "internal_code": "",
+            "short_key": "",
         }
 
     # ========================================================
@@ -1145,6 +1288,8 @@ def resolve_page(
         "order": "",
         "api": None,
         "source": "",
+        "internal_code": "",
+        "short_key": "",
     }
 
 
@@ -1198,7 +1343,9 @@ def wrap_text(
 
 def create_info_page(
     order_data,
-    order=""
+    order="",
+    internal_code="",
+    short_key=""
 ):
 
     buffer = BytesIO()
@@ -1211,18 +1358,13 @@ def create_info_page(
         )
     )
 
-    c.setFont(
-        FONT_NAME,
-        9
-    )
-
     left = 3 * mm
 
-    y = INFO_LABEL_HEIGHT - 6 * mm
+    y = INFO_LABEL_HEIGHT - 5 * mm
 
-    # --------------------------------------------------------
+    # ========================================================
     # НЕ РАСПОЗНАНО
-    # --------------------------------------------------------
+    # ========================================================
 
     if not order_data:
 
@@ -1234,7 +1376,40 @@ def create_info_page(
         c.drawString(
             left,
             y,
-            "Заказ: НЕ РАСПОЗНАН"
+            "ЗАКАЗ: НЕ РАСПОЗНАН"
+        )
+
+        y -= 7 * mm
+
+        c.setFont(
+            FONT_NAME,
+            9
+        )
+
+        if internal_code:
+
+            c.drawString(
+                left,
+                y,
+                f"II: {internal_code}"
+            )
+
+            y -= 5 * mm
+
+            if short_key:
+
+                c.drawString(
+                    left,
+                    y,
+                    f"Ключ: {short_key}"
+                )
+
+                y -= 5 * mm
+
+        c.drawString(
+            left,
+            y,
+            f"Отправление: {order or '-'}"
         )
 
         y -= 7 * mm
@@ -1245,7 +1420,12 @@ def create_info_page(
             "Арт: -"
         )
 
-        y -= 7 * mm
+        y -= 8 * mm
+
+        c.setFont(
+            FONT_NAME,
+            QUANTITY_FONT_SIZE
+        )
 
         c.drawString(
             left,
@@ -1253,12 +1433,17 @@ def create_info_page(
             "КОЛ-ВО: ?"
         )
 
-        y -= 7 * mm
+        y -= 8 * mm
+
+        c.setFont(
+            FONT_NAME,
+            8
+        )
 
         c.drawString(
             left,
             y,
-            "Название: НЕ НАЙДЕНО"
+            "ТРЕБУЕТ ПРОВЕРКИ"
         )
 
         c.showPage()
@@ -1268,9 +1453,9 @@ def create_info_page(
 
         return buffer.getvalue()
 
-    # --------------------------------------------------------
+    # ========================================================
     # ДАННЫЕ
-    # --------------------------------------------------------
+    # ========================================================
 
     article = normalize_text(
         order_data.get(
@@ -1286,33 +1471,73 @@ def create_info_page(
         )
     )
 
-    quantity = normalize_text(
+    quantity = clean_quantity(
         order_data.get(
             "quantity",
             ""
         )
     )
 
-    # --------------------------------------------------------
-    # ЗАКАЗ
-    # --------------------------------------------------------
+    order = normalize_order(
+        order
+    )
+
+    # ========================================================
+    # НОМЕР ОТПРАВЛЕНИЯ
+    # ========================================================
 
     c.setFont(
         FONT_NAME,
-        8.5
+        9
     )
 
     c.drawString(
         left,
         y,
-        f"Заказ: {order}"
+        f"Отправление: {order or '-'}"
     )
 
-    y -= 7 * mm
+    y -= 6 * mm
 
-    # --------------------------------------------------------
+    # ========================================================
+    # II / УНИКАЛЬНЫЙ ИНДЕНТИФИКАТОР
+    #
+    # Добавляем ТОЛЬКО если это тестовая II-этикетка.
+    # ========================================================
+
+    if internal_code:
+
+        c.setFont(
+            FONT_NAME,
+            8
+        )
+
+        c.drawString(
+            left,
+            y,
+            f"II: {internal_code}"
+        )
+
+        y -= 4.5 * mm
+
+        if short_key:
+
+            c.drawString(
+                left,
+                y,
+                f"Ключ: {short_key}"
+            )
+
+            y -= 5 * mm
+
+    # ========================================================
     # АРТИКУЛ
-    # --------------------------------------------------------
+    # ========================================================
+
+    c.setFont(
+        FONT_NAME,
+        9
+    )
 
     c.drawString(
         left,
@@ -1320,11 +1545,18 @@ def create_info_page(
         f"Арт: {article or '-'}"
     )
 
-    y -= 7 * mm
+    y -= 8 * mm
 
-    # --------------------------------------------------------
+    # ========================================================
     # КОЛИЧЕСТВО
-    # --------------------------------------------------------
+    #
+    # 16 pt
+    # ========================================================
+
+    c.setFont(
+        FONT_NAME,
+        QUANTITY_FONT_SIZE
+    )
 
     c.drawString(
         left,
@@ -1332,11 +1564,16 @@ def create_info_page(
         f"КОЛ-ВО: {quantity or '?'}"
     )
 
-    y -= 7 * mm
+    y -= 9 * mm
 
-    # --------------------------------------------------------
+    # ========================================================
     # НАЗВАНИЕ
-    # --------------------------------------------------------
+    # ========================================================
+
+    c.setFont(
+        FONT_NAME,
+        7.5
+    )
 
     c.drawString(
         left,
@@ -1344,7 +1581,7 @@ def create_info_page(
         "Название:"
     )
 
-    y -= 4.5 * mm
+    y -= 3.5 * mm
 
     name_lines = wrap_text(
         name or "НЕ НАЙДЕНО",
@@ -1359,7 +1596,7 @@ def create_info_page(
             line
         )
 
-        y -= 4 * mm
+        y -= 3.5 * mm
 
     c.showPage()
     c.save()
@@ -1421,9 +1658,21 @@ def build_result_pdf(
             ""
         )
 
+        internal_code = result.get(
+            "internal_code",
+            ""
+        )
+
+        short_key = result.get(
+            "short_key",
+            ""
+        )
+
         info_pdf = create_info_page(
             api_data,
-            order
+            order,
+            internal_code,
+            short_key
         )
 
         info_reader = PdfReader(
@@ -1485,6 +1734,18 @@ def diagnostics_dataframe(
                     ""
                 ),
 
+            "II":
+                item.get(
+                    "internal_code",
+                    ""
+                ),
+
+            "Ключ II":
+                item.get(
+                    "short_key",
+                    ""
+                ),
+
             "API":
                 "ДА"
                 if api_data
@@ -1503,9 +1764,11 @@ def diagnostics_dataframe(
                 ),
 
             "Количество":
-                api_data.get(
-                    "quantity",
-                    ""
+                clean_quantity(
+                    api_data.get(
+                        "quantity",
+                        ""
+                    )
                 ),
 
             "Источник":
@@ -1599,15 +1862,19 @@ if st.button(
 ):
 
     if not original_pdf:
+
         st.error(
             "Загрузите исходный PDF этикеток."
         )
+
         st.stop()
 
     if not api_file:
+
         st.error(
             "Загрузите API XLSX / CSV."
         )
+
         st.stop()
 
     try:
@@ -1841,6 +2108,16 @@ if st.button(
                     )
 
                     st.write(
+                        f"**II:** "
+                        f"{r.get('internal_code') or '-'}"
+                    )
+
+                    st.write(
+                        f"**Ключ II:** "
+                        f"{r.get('short_key') or '-'}"
+                    )
+
+                    st.write(
                         f"**Заказ:** "
                         f"{r.get('order') or '-'}"
                     )
@@ -1849,6 +2126,24 @@ if st.button(
                         f"**Источник:** "
                         f"{r.get('source') or '-'}"
                     )
+
+                    conflict_orders = r.get(
+                        "conflict_orders",
+                        []
+                    )
+
+                    if conflict_orders:
+
+                        st.warning(
+                            "Найдены разные номера "
+                            "отправлений для одной пары II + ключ:"
+                        )
+
+                        for conflict_order in conflict_orders:
+
+                            st.write(
+                                f"• {conflict_order}"
+                            )
 
                     st.code(
                         r.get(

@@ -883,11 +883,9 @@ def find_old_format_candidates(text, api_index):
 
 def build_picklist_index(picklist_pages):
     """
-    Создает дополнительный индекс листа подбора.
+    Индекс листа подбора.
 
-    Используется ТОЛЬКО как fallback.
-
-    Основным источником является API XLSX.
+    Храним полный номер отправления.
     """
 
     result = {}
@@ -897,12 +895,12 @@ def build_picklist_index(picklist_pages):
 
     for page in picklist_pages:
 
-        text = page.get("text", "")
+        text = page.get("text", "") or ""
 
         if not text:
             continue
 
-        # Ищем полные номера отправлений
+        # Полные номера отправлений
         matches = re.findall(
             r"\b\d{4,14}-\d{2,8}-\d{1,4}\b",
             text
@@ -912,11 +910,12 @@ def build_picklist_index(picklist_pages):
 
             order = normalize_order(match)
 
-            if order:
-                result[normalize_key(order)] = order
+            if not order:
+                continue
+
+            result[normalize_key(order)] = order
 
     return result
-
 
 def picklist_fallback(
     text,
@@ -982,22 +981,27 @@ def resolve_page(
     picklist_index=None
 ):
     """
-    Возвращает информацию о странице:
+    Распознавание одной страницы.
 
-    {
-        type,
-        key,
-        order,
-        api_found,
-        data
-    }
+    Поддерживает одновременно:
+
+    1. Обычный полный номер:
+       0115480687-0268-1
+
+    2. Старую этикетку:
+       011548 0687 -0268-1
+
+    3. Новую этикетку:
+       II5010320 2537
+
+    4. Fallback через лист подбора.
     """
 
-    text = page.get("text", "")
+    text = page.get("text", "") or ""
 
-    # --------------------------------------------------------
-    # 1. Прямой полный номер
-    # --------------------------------------------------------
+    # ========================================================
+    # 1. ПРЯМОЙ ПОЛНЫЙ НОМЕР
+    # ========================================================
 
     direct = find_direct_order_candidates(
         text,
@@ -1021,9 +1025,15 @@ def resolve_page(
             "data": data,
         }
 
-    # --------------------------------------------------------
+    # ========================================================
     # 2. СТАРЫЙ ФОРМАТ
-    # --------------------------------------------------------
+    #
+    # 011548
+    # 0687
+    # -0268-1
+    #
+    # -> 0115480687-0268-1
+    # ========================================================
 
     old_candidates = find_old_format_candidates(
         text,
@@ -1047,9 +1057,17 @@ def resolve_page(
             "data": data,
         }
 
-    # --------------------------------------------------------
-    # 3. Новый формат II...
-    # --------------------------------------------------------
+    # ========================================================
+    # 3. НОВЫЙ ФОРМАТ
+    #
+    # Например:
+    #
+    # II5010320 2537
+    #
+    # Здесь:
+    # II5010320 = технический код
+    # 2537       = код, по которому ищем отправление
+    # ========================================================
 
     internal_codes = find_internal_codes(text)
 
@@ -1057,24 +1075,194 @@ def resolve_page(
 
         internal_code = internal_codes[0]
 
-        # Новый II-код сам по себе не является номером
-        # отправления.
-        #
-        # Поэтому НЕ подменяем им order.
-        #
-        # Пока оставляем его как диагностический ключ.
+        # ----------------------------------------------------
+        # Ищем 4-значный номер после II-кода
+        # ----------------------------------------------------
+
+        new_key = ""
+
+        # Сначала пробуем найти число непосредственно
+        # после II-кода
+        pattern = re.search(
+            r"II[A-Z0-9]{4,30}\s+(\d{4})\b",
+            text,
+            flags=re.IGNORECASE
+        )
+
+        if pattern:
+
+            new_key = pattern.group(1)
+
+        else:
+
+            # Если extract_text поменял порядок,
+            # ищем вообще 4-значные числа на странице.
+            #
+            # Например PDF может вернуть:
+            #
+            # 2537
+            # II5010320
+
+            numeric_tokens = re.findall(
+                r"(?<!\d)\d{4}(?!\d)",
+                text
+            )
+
+            if numeric_tokens:
+
+                new_key = numeric_tokens[0]
+
+        # ----------------------------------------------------
+        # Ищем отправление по 4-значному ключу
+        # ----------------------------------------------------
+
+        if new_key:
+
+            new_candidates = []
+
+            for key, data in api_index.items():
+
+                order = normalize_order(
+                    data.get("order", "")
+                )
+
+                if not order:
+                    continue
+
+                # В новом формате 2537 является
+                # частью внутренней маркировки.
+                #
+                # Сначала проверяем окончание.
+                if (
+                    order.endswith(new_key)
+                    or new_key in order
+                ):
+
+                    if order not in new_candidates:
+
+                        new_candidates.append(
+                            order
+                        )
+
+            # ------------------------------------------------
+            # Если нашли ровно один вариант — принимаем.
+            # ------------------------------------------------
+
+            if len(new_candidates) == 1:
+
+                order = new_candidates[0]
+
+                data = get_order_data(
+                    api_index,
+                    order
+                )
+
+                return {
+                    "type": "Новый формат",
+                    "key": new_key,
+                    "order": order,
+                    "api_found": True,
+                    "data": data,
+                }
+
+            # ------------------------------------------------
+            # Если вариантов несколько — пробуем лист подбора
+            # ------------------------------------------------
+
+            if picklist_index:
+
+                pick_candidates = []
+
+                for key, pick_order in picklist_index.items():
+
+                    normalized_pick = normalize_order(
+                        pick_order
+                    )
+
+                    if (
+                        normalized_pick.endswith(new_key)
+                        or new_key in normalized_pick
+                    ):
+
+                        if normalized_pick not in pick_candidates:
+
+                            pick_candidates.append(
+                                normalized_pick
+                            )
+
+                # Если после листа подбора остался
+                # один вариант
+                if len(pick_candidates) == 1:
+
+                    order = pick_candidates[0]
+
+                    data = get_order_data(
+                        api_index,
+                        order
+                    )
+
+                    if data:
+
+                        return {
+                            "type": "Новый формат",
+                            "key": new_key,
+                            "order": order,
+                            "api_found": True,
+                            "data": data,
+                        }
+
+            # ------------------------------------------------
+            # Если API дал несколько кандидатов,
+            # но среди них есть точное совпадение
+            # по окончанию — используем его.
+            # ------------------------------------------------
+
+            exact_candidates = [
+                candidate
+                for candidate in new_candidates
+                if candidate.endswith(new_key)
+            ]
+
+            if len(exact_candidates) == 1:
+
+                order = exact_candidates[0]
+
+                data = get_order_data(
+                    api_index,
+                    order
+                )
+
+                return {
+                    "type": "Новый формат",
+                    "key": new_key,
+                    "order": order,
+                    "api_found": True,
+                    "data": data,
+                }
+
+        # ----------------------------------------------------
+        # Новый формат найден, но отправление пока
+        # не сопоставилось.
+        # ----------------------------------------------------
 
         return {
             "type": "Новый формат",
-            "key": internal_code,
+            "key": (
+                internal_code
+                + (
+                    " " + new_key
+                    if new_key
+                    else ""
+                )
+            ),
             "order": "",
             "api_found": False,
             "data": None,
         }
 
-    # --------------------------------------------------------
-    # 4. Picklist fallback
-    # --------------------------------------------------------
+    # ========================================================
+    # 4. FALLBACK ЧЕРЕЗ ЛИСТ ПОДБОРА
+    # ========================================================
 
     fallback = picklist_fallback(
         text,
@@ -1099,9 +1287,9 @@ def resolve_page(
             "data": data,
         }
 
-    # --------------------------------------------------------
-    # 5. Не распознано
-    # --------------------------------------------------------
+    # ========================================================
+    # 5. НЕ РАСПОЗНАНО
+    # ========================================================
 
     return {
         "type": "Не распознано",
@@ -1110,9 +1298,7 @@ def resolve_page(
         "api_found": False,
         "data": None,
     }
-
-
-# ============================================================
+    # ============================================================
 # ПЕРЕНОС ТЕКСТА НА ИНФО-НАКЛЕЙКУ
 # ============================================================
 

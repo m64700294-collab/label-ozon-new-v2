@@ -22,7 +22,7 @@ INFO_LABEL_HEIGHT = 40 * mm
 FONT_NAME = "Roboto"
 
 # Размер количества
-QUANTITY_FONT_SIZE = 16
+QUANTITY_FONT_SIZE = 12
 
 # ============================================================
 # ШРИФТ

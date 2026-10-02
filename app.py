@@ -1,510 +1,1921 @@
-import io
+import streamlit as st
 import re
 import os
-import urllib.request
-from collections import defaultdict
-
-import streamlit as st
-import pdfplumber
+from io import BytesIO
 
 from pypdf import PdfReader, PdfWriter
+import pdfplumber
+
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+
+import requests
+
 
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
 
 st.set_page_config(
-    page_title="Ozon — Этикетки + Лист подбора",
+    page_title="Умная склейка этикеток Ozon",
     page_icon="🖨️",
     layout="wide"
 )
 
-FONT_PATH = "Roboto_Full_Final.ttf"
-FONT_URL = "https://cdnjs.cloudflare.com/ajax/libs/roboto/2.138/fonts/ttf/Roboto-Regular.ttf"
+st.title("🖨️ Склейка: Этикетки + Лист подбора")
+st.write(
+    "Склейка этикеток Ozon с листом подбора "
+    "по графическим строкам и коду этикетки."
+)
+
 
 # ============================================================
 # ШРИФТ
 # ============================================================
 
 @st.cache_resource
-def ensure_font():
-    if os.path.exists(FONT_PATH):
-        return FONT_PATH
-    try:
-        urllib.request.urlretrieve(FONT_URL, FONT_PATH)
-        return FONT_PATH
-    except Exception:
-        return None
+def load_font():
 
-FONT_FILE = ensure_font()
+    font_path = "Roboto_Full_Final.ttf"
 
-if FONT_FILE:
+    if not os.path.exists(font_path):
+
+        url = (
+            "https://cdnjs.cloudflare.com/ajax/libs/"
+            "pdfmake/0.1.66/fonts/Roboto/Roboto-Regular.ttf"
+        )
+
+        r = requests.get(
+            url,
+            timeout=30
+        )
+
+        r.raise_for_status()
+
+        with open(
+            font_path,
+            "wb"
+        ) as f:
+            f.write(r.content)
+
     try:
-        pdfmetrics.registerFont(TTFont("Roboto", FONT_FILE))
-        PDF_FONT = "Roboto"
+        pdfmetrics.getFont("OzonFont")
     except Exception:
-        PDF_FONT = "Helvetica"
-else:
-    PDF_FONT = "Helvetica"
+        pdfmetrics.registerFont(
+            TTFont(
+                "OzonFont",
+                font_path
+            )
+        )
+
+    return "OzonFont"
+
+
+font_name = load_font()
+
 
 # ============================================================
-# ОБЩИЕ ФУНКЦИИ
+# НОРМАЛИЗАЦИЯ
 # ============================================================
 
-def clean_spaces(value):
-    if value is None: return ""
+def normalize_text(value):
+
+    if value is None:
+        return ""
+
     value = str(value)
-    value = value.replace("\xa0", " ").replace("\u200b", "").replace("\ufeff", "")
-    value = re.sub(r"[ \t]+", " ", value)
+
+    value = (
+        value
+        .replace("\xa0", " ")
+        .replace("і", "i")
+        .replace("І", "i")
+    )
+
     return value.strip()
 
-def clean_identifier(value):
-    if value is None: return ""
-    value = str(value)
-    value = re.sub(r"[\xa0 \n\r\t]", "", value)
-    return value.lower()
 
-def digits_only(value):
-    if not value: return ""
-    return re.sub(r"\D", "", str(value))
+def normalize_order(value):
+
+    value = normalize_text(value)
+
+    value = (
+        value
+        .lower()
+        .replace(" ", "")
+        .replace("\t", "")
+    )
+
+    return value
+
 
 # ============================================================
-# НОМЕРА ОТПРАВЛЕНИЙ И ЭТИКЕТКИ
+# КОД ЭТИКЕТКИ
 # ============================================================
 
-ORDER_PATTERN = re.compile(r"\d{8,15}-\d{4}-\d+", re.IGNORECASE)
+def get_label_code(value):
 
-def get_short_code(order):
-    if not order: return ""
-    order = clean_identifier(order)
-    if "-" in order:
-        digits = digits_only(order.split("-")[0])
-        if len(digits) >= 4: return digits[-4:]
-    digits = digits_only(order)
-    if len(digits) >= 4: return digits[-4:]
-    return ""
+    value = normalize_order(value)
 
-def get_last4(value):
-    digits = digits_only(value)
-    if len(digits) >= 4: return digits[-4:]
-    return ""
+    if not value:
+        return ""
 
-def extract_orders_from_text(text):
-    if not text: return []
-    text = str(text)
+    # --------------------------------------------------------
+    # Стандартный номер:
+    #
+    # 78277691-0407-1
+    #
+    # -> 7691
+    # --------------------------------------------------------
+
+    if "-" in value:
+
+        first_part = value.split("-")[0]
+
+        digits = re.sub(
+            r"\D",
+            "",
+            first_part
+        )
+
+        if len(digits) >= 4:
+            return digits[-4:]
+
+    # --------------------------------------------------------
+    # ii50103202537
+    #
+    # -> 2537
+    # --------------------------------------------------------
+
+    digits = re.sub(
+        r"\D",
+        "",
+        value
+    )
+
+    if len(digits) >= 4:
+        return digits[-4:]
+
+    return value[-4:]
+
+
+# ============================================================
+# ПОЛНЫЙ ЧИСЛОВОЙ КЛЮЧ
+# ============================================================
+
+def get_numeric_key(value):
+
+    value = normalize_order(value)
+
+    return re.sub(
+        r"\D",
+        "",
+        value
+    )
+
+
+# ============================================================
+# ПОИСК НОМЕРОВ
+# ============================================================
+
+ORDER_PATTERN = re.compile(
+    r"""
+    (?:
+        \d{8,15}
+        \s*
+        -
+        \s*
+        \d{4}
+        \s*
+        -
+        \s*
+        \d+
+    )
+    |
+    (?:
+        (?:ii|i)?\d{10,15}
+    )
+    """,
+    re.IGNORECASE |
+    re.VERBOSE
+)
+
+
+def find_orders(text):
+
+    if not text:
+        return []
+
     result = []
-    
-    # Цельный номер
-    for order in ORDER_PATTERN.findall(text):
-        if order not in result: result.append(order)
-            
-    # Разбитый номер (разрыв строки)
-    flat = re.sub(r"\s+", "", text)
-    for a, b in re.findall(r"(\d{8,15})(-\d{4}-\d+)", flat):
-        order = a + b
-        if order not in result: result.append(order)
-            
+
+    for match in ORDER_PATTERN.finditer(text):
+
+        value = match.group(0)
+
+        value = re.sub(
+            r"\s+",
+            "",
+            value
+        )
+
+        result.append(value)
+
     return result
 
-def extract_ii_barcodes(text):
-    if not text: return []
+
+# ============================================================
+# СОЕДИНЕНИЕ РАЗОРВАННОГО НОМЕРА
+# ============================================================
+
+def normalize_extracted_order(text):
+
+    if not text:
+        return ""
+
+    value = normalize_text(text)
+
+    # 78277691 -0407-1
+    value = re.sub(
+        r"(\d{8,15})\s*-\s*(\d{4})\s*-\s*(\d+)",
+        r"\1-\2-\3",
+        value
+    )
+
+    # ii5010320 2537
+    value = re.sub(
+        r"(ii\d{6,15})\s+(\d{4})",
+        r"\1\2",
+        value,
+        flags=re.IGNORECASE
+    )
+
+    return value
+
+
+# ============================================================
+# ПОИСК НОМЕРА НА ЭТИКЕТКЕ
+# ============================================================
+
+def extract_order_from_label(text):
+
+    if not text:
+        return None
+
+    text = normalize_extracted_order(
+        text
+    )
+
+    # --------------------------------------------------------
+    # Сначала стандартный Ozon
+    # --------------------------------------------------------
+
+    m = re.search(
+        r"\d{8,15}-\d{4}-\d+",
+        text
+    )
+
+    if m:
+        return m.group(0)
+
+    # --------------------------------------------------------
+    # ii + номер
+    # --------------------------------------------------------
+
+    m = re.search(
+        r"ii\d{10,16}",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    if m:
+        return m.group(0)
+
+    # --------------------------------------------------------
+    # Просто длинный номер
+    # --------------------------------------------------------
+
+    numbers = re.findall(
+        r"\d{10,15}",
+        text
+    )
+
+    if numbers:
+
+        # Предпочитаем длиннейший
+        numbers.sort(
+            key=len,
+            reverse=True
+        )
+
+        return numbers[0]
+
+    return None
+
+
+# ============================================================
+# ГОРИЗОНТАЛЬНЫЕ ЛИНИИ
+# ============================================================
+
+def get_horizontal_lines(page):
+
     result = []
-    matches = re.findall(r"\bii[\s\d]{8,30}", text, flags=re.IGNORECASE)
-    for value in matches:
-        value = clean_identifier(value)
-        match = re.match(r"(ii\d+)", value, flags=re.IGNORECASE)
-        if match:
-            barcode = match.group(1)
-            if barcode not in result: result.append(barcode)
-    return result
 
-def extract_label_code(text):
-    if not text: return ""
-    codes = re.findall(r"(?<!\d)(\d{4})(?!\d)", text)
-    if codes: return codes[-1]
-    return ""
+    for line in page.lines:
 
-# ============================================================
-# ГОРИЗОНТАЛЬНЫЕ ЛИНИИ И БЛОКИ
-# ============================================================
+        try:
 
-def get_horizontal_blocks(page):
-    lines = []
-    try:
-        for line in page.lines:
-            x0, x1 = float(line.get("x0", 0)), float(line.get("x1", 0))
-            y0, y1 = float(line.get("top", 0)), float(line.get("bottom", y0))
-            width, height = abs(x1 - x0), abs(y1 - y0)
-            
+            width = float(
+                line.get(
+                    "width",
+                    0
+                )
+            )
+
+            height = abs(
+                float(
+                    line.get(
+                        "height",
+                        0
+                    )
+                )
+            )
+
+            # Горизонтальная линия:
+            # большая ширина
+            # очень маленькая высота
+
             if width > 30 and height < 3:
-                lines.append({"top": y0, "x0": min(x0, x1), "x1": max(x0, x1), "width": width})
-    except Exception:
-        pass
 
-    lines.sort(key=lambda x: x["top"])
-    unique_lines = []
-    
-    for line in lines:
-        if not unique_lines:
-            unique_lines.append(line)
+                result.append(
+                    line
+                )
+
+        except Exception:
             continue
-        if abs(line["top"] - unique_lines[-1]["top"]) < 2:
-            if line["width"] > unique_lines[-1]["width"]:
-                unique_lines[-1] = line
-        else:
-            unique_lines.append(line)
 
-    blocks = []
-    if len(unique_lines) < 2: return blocks
+    result.sort(
+        key=lambda x: float(
+            x.get(
+                "top",
+                0
+            )
+        )
+    )
 
-    for i in range(len(unique_lines) - 1):
-        top, bottom = unique_lines[i]["top"], unique_lines[i + 1]["top"]
-        if bottom - top < 10: continue
-        blocks.append({
-            "top": top,
-            "bottom": bottom,
-            "x0": min(unique_lines[i]["x0"], unique_lines[i + 1]["x0"]),
-            "x1": max(unique_lines[i]["x1"], unique_lines[i + 1]["x1"])
-        })
-    return blocks
+    return result
 
-def extract_block_text(page, block):
-    bbox = (block["x0"], block["top"] + 1, block["x1"], block["bottom"] - 1)
+
+# ============================================================
+# КООРДИНАТЫ СТРОК
+# ============================================================
+
+def get_row_boxes(page):
+
+    horizontal_lines = get_horizontal_lines(
+        page
+    )
+
+    y_coords = [0]
+
+    for line in horizontal_lines:
+
+        try:
+            y = float(
+                line.get(
+                    "top",
+                    0
+                )
+            )
+
+            y_coords.append(
+                y
+            )
+
+        except Exception:
+            pass
+
+    y_coords.append(
+        float(page.height)
+    )
+
+    # Удаляем дубликаты
+
+    y_coords = sorted(
+        set(
+            round(
+                y,
+                2
+            )
+            for y in y_coords
+        )
+    )
+
+    boxes = []
+
+    for i in range(
+        len(y_coords) - 1
+    ):
+
+        top = y_coords[i]
+        bottom = y_coords[i + 1]
+
+        if bottom - top < 15:
+            continue
+
+        boxes.append(
+            (
+                0,
+                top,
+                float(page.width),
+                bottom
+            )
+        )
+
+    return boxes
+
+
+# ============================================================
+# ОПРЕДЕЛЕНИЕ КОЛОНОК
+# ============================================================
+
+def detect_columns(page):
+
+    """
+    Автоматически определяет вертикальные зоны таблицы.
+
+    Для твоего формата:
+
+    №
+    Номер отправления
+    Фото
+    Товар
+    Артикул
+    Кол-во
+    Этикетка
+    """
+
+    width = float(
+        page.width
+    )
+
+    # --------------------------------------------------------
+    # ВАЖНО:
+    #
+    # Эти значения являются относительными.
+    # Они не зависят от конкретного размера страницы.
+    # --------------------------------------------------------
+
+    columns = {
+
+        "number": (
+            0.00 * width,
+            0.08 * width
+        ),
+
+        "order": (
+            0.08 * width,
+            0.29 * width
+        ),
+
+        "photo": (
+            0.29 * width,
+            0.39 * width
+        ),
+
+        "product": (
+            0.39 * width,
+            0.72 * width
+        ),
+
+        "article": (
+            0.72 * width,
+            0.84 * width
+        ),
+
+        "qty": (
+            0.84 * width,
+            0.92 * width
+        ),
+
+        "label": (
+            0.92 * width,
+            1.00 * width
+        )
+    }
+
+    return columns
+
+
+# ============================================================
+# ПОИСК ТЕКСТА В КОЛОНКЕ
+# ============================================================
+
+def extract_column_text(
+    page,
+    bbox,
+    x1,
+    x2
+):
+
+    top = bbox[1]
+    bottom = bbox[3]
+
+    # Небольшой запас,
+    # чтобы не терять текст на границах
+
+    margin = 2
+
+    column_bbox = (
+        max(
+            0,
+            x1 - margin
+        ),
+        top,
+        min(
+            page.width,
+            x2 + margin
+        ),
+        bottom
+    )
+
     try:
-        crop = page.within_bbox(bbox)
-        text = crop.extract_text(layout=True)
-        return text or ""
+
+        crop = page.crop(
+            column_bbox
+        )
+
+        text = crop.extract_text(
+            layout=False
+        )
+
+        if not text:
+            return ""
+
+        return normalize_text(
+            text
+        )
+
     except Exception:
         return ""
 
+
 # ============================================================
-# АНАЛИЗ ТЕКСТА БЛОКА (НОВАЯ ЛОГИКА)
+# ИЗВЛЕЧЕНИЕ ТЕКСТА ПО X-КООРДИНАТАМ
 # ============================================================
 
-def analyze_block_data(text, orders, label):
-    """
-    Извлекает Артикул, Количество и Название без привязки к заголовкам таблицы.
-    """
-    clean_text = text.replace("\n", " ")
-    
-    # 1. Формируем список запрещенных кодов, чтобы не принять их за QTY
-    forbidden_codes = set()
-    if label: forbidden_codes.add(label)
-    for ord_num in orders:
-        clean_text = clean_text.replace(ord_num, " ")
-        short = get_short_code(ord_num)
-        if short: forbidden_codes.add(short)
-            
-    for code in forbidden_codes:
-        if code:
-            clean_text = re.sub(rf"(?<!\d){re.escape(code)}(?!\d)", " ", clean_text)
-            
-    # 2. Убираем случайные заголовки таблицы, если они попали в срез
-    headers = r"(Склад МСК|Склад:|Служба доставки|Дата:|Фото|Товар|Артикул|Кол-во|Этикетка|Ozon|№)"
-    clean_text = re.sub(headers, " ", clean_text, flags=re.IGNORECASE)
-    clean_text = clean_text.replace("|", " ")
-    clean_text = re.sub(r"\s+", " ", clean_text).strip()
-    
-    article = "-"
-    qty = "1" # По умолчанию 1, чтобы не цеплять маршрутные коды Ozon
-    name = "Товар"
-    
-    if not clean_text:
-        return name, article, qty
+def extract_words_by_x(
+    page,
+    bbox
+):
 
-    # 3. Ищем паттерн в конце строки: [Артикул] [Количество]
-    m = re.search(r'\s+([A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9_\-/.]+)\s+(\d{1,3})$', clean_text)
-    if m:
-        cand_article = m.group(1)
-        cand_qty = m.group(2)
-        if cand_article not in forbidden_codes and cand_qty not in forbidden_codes:
-            article = cand_article
-            qty = cand_qty
-            name = clean_text[:m.start()].strip()
-    else:
-        # Fallback: смотрим на последние слова
-        words = clean_text.split()
-        if words:
-            # Проверяем последнее слово на количество
-            if re.fullmatch(r'\d{1,3}', words[-1]) and words[-1] not in forbidden_codes:
-                qty = words[-1]
-                words = words[:-1]
-                
-            # Проверяем новое последнее слово на артикул
-            if words and len(words[-1]) >= 2 and not words[-1].isdigit():
-                article = words[-1]
-                words = words[:-1]
-                
-            name = " ".join(words).strip()
-            
-    if not name or len(name) < 2:
-        name = "Товар"
-        
-    return name, article, qty
+    try:
 
-def parse_one_assembly_block(page, block):
-    text = extract_block_text(page, block)
-    if not text: return None
+        words = page.extract_words(
+            x_tolerance=2,
+            y_tolerance=3,
+            keep_blank_chars=False
+        )
 
-    orders = extract_orders_from_text(text)
-    label = extract_label_code(text)
-    if not label and orders:
-        label = get_short_code(orders[0])
+    except Exception:
+        return []
 
-    # Если в блоке нет ни заказа, ни этикетки - это пустой блок или шапка таблицы
-    if not orders and not label:
+    result = []
+
+    for word in words:
+
+        wx1 = float(
+            word.get(
+                "x0",
+                0
+            )
+        )
+
+        wx2 = float(
+            word.get(
+                "x1",
+                0
+            )
+        )
+
+        wy1 = float(
+            word.get(
+                "top",
+                0
+            )
+        )
+
+        wy2 = float(
+            word.get(
+                "bottom",
+                0
+            )
+        )
+
+        # Проверяем попадание слова
+        # внутрь строки
+
+        if wy2 < bbox[1]:
+            continue
+
+        if wy1 > bbox[3]:
+            continue
+
+        result.append(
+            {
+                "text": word.get(
+                    "text",
+                    ""
+                ),
+                "x0": wx1,
+                "x1": wx2,
+                "top": wy1,
+                "bottom": wy2
+            }
+        )
+
+    return result
+
+
+# ============================================================
+# ОПРЕДЕЛЕНИЕ КОЛОНКИ СЛОВА
+# ============================================================
+
+def word_in_column(
+    word,
+    column
+):
+
+    x1 = word["x0"]
+    x2 = word["x1"]
+
+    c1 = column[0]
+    c2 = column[1]
+
+    center = (
+        x1 + x2
+    ) / 2
+
+    return (
+        center >= c1
+        and center <= c2
+    )
+
+
+# ============================================================
+# ТЕКСТ КОЛОНКИ ЧЕРЕЗ СЛОВА
+# ============================================================
+
+def get_column_from_words(
+    words,
+    column
+):
+
+    selected = []
+
+    for word in words:
+
+        if word_in_column(
+            word,
+            column
+        ):
+
+            selected.append(
+                word
+            )
+
+    selected.sort(
+        key=lambda x: (
+            x["top"],
+            x["x0"]
+        )
+    )
+
+    return " ".join(
+        word["text"]
+        for word in selected
+    ).strip()
+
+
+# ============================================================
+# ОЧИСТКА АРТИКУЛА
+# ============================================================
+
+def clean_article(value):
+
+    if not value:
+        return "-"
+
+    value = normalize_text(
+        value
+    )
+
+    value = re.sub(
+        r"\s+",
+        "",
+        value
+    )
+
+    # Убираем мусор вокруг
+
+    value = value.strip(
+        "|:;,. "
+    )
+
+    # Если случайно попало несколько
+    # значений, выбираем наиболее похожее
+    # на артикул.
+
+    tokens = re.findall(
+        r"[A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9_.\-/]*",
+        value
+    )
+
+    if not tokens:
+        return "-"
+
+    # Предпочитаем значение с буквами
+
+    for token in tokens:
+
+        if re.search(
+            r"[A-Za-zА-Яа-я]",
+            token
+        ):
+
+            return token
+
+    return tokens[0]
+
+
+# ============================================================
+# ОЧИСТКА КОЛИЧЕСТВА
+# ============================================================
+
+def clean_qty(value):
+
+    if not value:
+        return "1"
+
+    value = normalize_text(
+        value
+    )
+
+    numbers = re.findall(
+        r"(?<!\d)\d{1,4}(?!\d)",
+        value
+    )
+
+    if not numbers:
+        return "1"
+
+    # Берём первое число именно
+    # из колонки Кол-во.
+
+    for number in numbers:
+
+        try:
+
+            qty = int(
+                number
+            )
+
+            if 1 <= qty <= 9999:
+
+                return str(
+                    qty
+                )
+
+        except Exception:
+            continue
+
+    return "1"
+
+
+# ============================================================
+# ОЧИСТКА НАЗВАНИЯ
+# ============================================================
+
+def clean_product_name(value):
+
+    if not value:
+        return "Товар"
+
+    value = normalize_text(
+        value
+    )
+
+    value = re.sub(
+        r"\s+",
+        " ",
+        value
+    ).strip()
+
+    # --------------------------------------------------------
+    # Оставляем максимум 20 символов,
+    # как ты просил.
+    # --------------------------------------------------------
+
+    if len(value) > 20:
+
+        value = value[:20].rstrip() + "..."
+
+    return value
+
+
+# ============================================================
+# РАЗБОР ОДНОЙ СТРОКИ
+# ============================================================
+
+def parse_row(
+    page,
+    bbox,
+    columns
+):
+
+    # Получаем слова с координатами
+
+    words = extract_words_by_x(
+        page,
+        bbox
+    )
+
+    if not words:
         return None
 
-    # Извлекаем данные товара
-    product, article, qty = analyze_block_data(text, orders, label)
+    # --------------------------------------------------------
+    # Получаем содержимое колонок
+    # --------------------------------------------------------
 
-    identifiers = set()
+    order_text = get_column_from_words(
+        words,
+        columns["order"]
+    )
+
+    product_text = get_column_from_words(
+        words,
+        columns["product"]
+    )
+
+    article_text = get_column_from_words(
+        words,
+        columns["article"]
+    )
+
+    qty_text = get_column_from_words(
+        words,
+        columns["qty"]
+    )
+
+    label_text = get_column_from_words(
+        words,
+        columns["label"]
+    )
+
+    # --------------------------------------------------------
+    # Иногда PDF неправильно разбивает номер.
+    # Пробуем также обычный текст строки.
+    # --------------------------------------------------------
+
+    full_row_text = " ".join(
+        word["text"]
+        for word in words
+    )
+
+    order_text = (
+        order_text
+        + " "
+        + full_row_text
+    )
+
+    # --------------------------------------------------------
+    # Ищем номер отправления
+    # --------------------------------------------------------
+
+    orders = find_orders(
+        order_text
+    )
+
+    # --------------------------------------------------------
+    # Если стандартный номер не найден,
+    # пробуем внутренний номер.
+    # --------------------------------------------------------
+
+    if not orders:
+
+        m = re.search(
+            r"(?:ii)?\d{10,16}",
+            full_row_text,
+            flags=re.IGNORECASE
+        )
+
+        if m:
+            orders = [
+                m.group(0)
+            ]
+
+    # --------------------------------------------------------
+    # Код этикетки
+    # --------------------------------------------------------
+
+    label_digits = re.findall(
+        r"\d{4}",
+        label_text
+    )
+
+    label_code = ""
+
+    if label_digits:
+
+        # Берём последнее 4-значное
+        # значение в колонке Этикетка
+
+        label_code = label_digits[-1]
+
+    # --------------------------------------------------------
+    # Если номер найден,
+    # нормализуем
+    # --------------------------------------------------------
+
+    normalized_orders = []
+
     for order in orders:
-        cleaned = clean_identifier(order)
-        if cleaned: identifiers.add(cleaned)
-        numeric = digits_only(order)
-        if numeric: identifiers.add(numeric)
-        short = get_short_code(order)
-        if short: identifiers.add(short)
 
-    if label:
-        identifiers.add(clean_identifier(label))
+        order = normalize_extracted_order(
+            order
+        )
+
+        if order:
+            normalized_orders.append(
+                order
+            )
+
+    # --------------------------------------------------------
+    # Если вообще нет номера и этикетки,
+    # это скорее всего заголовок/служебная строка
+    # --------------------------------------------------------
+
+    if (
+        not normalized_orders
+        and not label_code
+    ):
+
+        return None
+
+    # --------------------------------------------------------
+    # Артикул
+    # --------------------------------------------------------
+
+    article = clean_article(
+        article_text
+    )
+
+    # --------------------------------------------------------
+    # Количество
+    # --------------------------------------------------------
+
+    qty = clean_qty(
+        qty_text
+    )
+
+    # --------------------------------------------------------
+    # Название
+    # --------------------------------------------------------
+
+    product = clean_product_name(
+        product_text
+    )
 
     return {
-        "orders": orders,
+        "orders": normalized_orders,
+        "label_code": label_code,
         "article": article,
         "qty": qty,
-        "product": product,
-        "label": label,
-        "identifiers": identifiers,
-        "raw_text": text,
+        "name": product
     }
 
-# ============================================================
-# ПАРСИНГ ЛИСТА ПОДБОРА И МАППИНГ
-# ============================================================
-
-def parse_assembly_pdf(pdf_bytes):
-    records = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page_number, page in enumerate(pdf.pages, start=1):
-            blocks = get_horizontal_blocks(page)
-            for block in blocks:
-                record = parse_one_assembly_block(page, block)
-                if record:
-                    record["page"] = page_number
-                    records.append(record)
-
-    # Дедупликация
-    unique_records = []
-    seen = set()
-    for r in records:
-        key = (tuple(r["orders"]), r["label"], r["article"])
-        if key not in seen:
-            seen.add(key)
-            unique_records.append(r)
-
-    identifier_map = defaultdict(list)
-    label_map = defaultdict(list)
-
-    for record in unique_records:
-        for identifier in record["identifiers"]:
-            identifier = clean_identifier(identifier)
-            if identifier:
-                identifier_map[identifier].append(record)
-        label = clean_identifier(record.get("label", ""))
-        if label:
-            label_map[label].append(record)
-
-    return unique_records, identifier_map, label_map
-
-def unique_record(records):
-    if not records: return None
-    unique = []
-    seen = set()
-    for r in records:
-        key = (tuple(r.get("orders", [])), r.get("label", ""), r.get("article", ""))
-        if key not in seen:
-            seen.add(key)
-            unique.append(r)
-    if len(unique) == 1: return unique[0]
-    return None
-
-def find_record_for_label(label_text, identifier_map, label_map):
-    orders = extract_orders_from_text(label_text)
-    for order in orders:
-        key = clean_identifier(order)
-        record = unique_record(identifier_map.get(key, []))
-        if record: return record, "Полный номер"
-        
-        numeric = digits_only(order)
-        record = unique_record(identifier_map.get(numeric, []))
-        if record: return record, "Цифровой ключ"
-
-    barcodes = extract_ii_barcodes(label_text)
-    for barcode in barcodes:
-        record = unique_record(identifier_map.get(clean_identifier(barcode), []))
-        if record: return record, "Штрихкод ii"
-        
-        last4 = get_last4(barcode)
-        if last4:
-            record = unique_record(label_map.get(last4, []))
-            if record: return record, "4 цифры штрихкода"
-
-    codes = list(dict.fromkeys(re.findall(r"(?<!\d)(\d{4})(?!\d)", label_text)))
-    for code in codes:
-        record = unique_record(label_map.get(code, []))
-        if record: return record, "4 цифры с этикетки"
-
-    return None, "Не найдено"
 
 # ============================================================
-# ГЕНЕРАЦИЯ PDF
+# СОХРАНЕНИЕ В МАППИНГ
 # ============================================================
 
-def create_info_page(width, height, order, article, product, qty):
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=(width, height))
-    margin = 15
-    y = height - 25
+def save_mapping(
+    data,
+    row
+):
 
-    c.setFont(PDF_FONT, 12)
-    c.drawString(margin, y, f"Заказ: {order}")
-    c.line(margin, y - 5, width - margin, y - 5)
-    
-    y -= 25
-    c.drawString(margin, y, f"Арт: {article or '-'}")
-    y -= 20
-    
-    # Перенос названия товара
-    c.setFont(PDF_FONT, 10)
-    words = clean_spaces(product).split()
-    line = ""
-    for word in words:
-        if len(line) + len(word) < 40:
-            line += word + " "
-        else:
-            c.drawString(margin, y, line.strip())
-            y -= 12
-            line = word + " "
-    if line:
-        c.drawString(margin, y, line.strip())
+    item = {
+        "name": row["name"],
+        "article": row["article"],
+        "qty": row["qty"]
+    }
 
-    c.setFont(PDF_FONT, 20)
-    c.drawString(margin, 20, f"КОЛ-ВО: {qty or '1'}")
-    c.showPage()
-    c.save()
-    
-    buffer.seek(0)
-    return buffer.getvalue()
+    # --------------------------------------------------------
+    # По коду Этикетка
+    # --------------------------------------------------------
 
-def process_files(labels_bytes, assembly_bytes):
-    records, identifier_map, label_map = parse_assembly_pdf(assembly_bytes)
-    
-    label_reader = PdfReader(io.BytesIO(labels_bytes))
-    writer = PdfWriter()
-
-    matched = 0
-    not_found = 0
-    methods = defaultdict(int)
-    diagnostics = []
-
-    with pdfplumber.open(io.BytesIO(labels_bytes)) as labels_pdf:
-        for page_index, page in enumerate(labels_pdf.pages):
-            text = page.extract_text(x_tolerance=2, y_tolerance=3, layout=True) or ""
-            text_no_underscores = re.sub(r'_\d+', '', text)
-            
-            record, method = find_record_for_label(text_no_underscores, identifier_map, label_map)
-
-            original_page = label_reader.pages[page_index]
-            writer.add_page(original_page)
-            width, height = float(original_page.mediabox.width), float(original_page.mediabox.height)
-
-            if record:
-                matched += 1
-                methods[method] += 1
-                order = record["orders"][0] if record["orders"] else ""
-                
-                info_pdf = create_info_page(
-                    width=width, height=height, order=order,
-                    article=record.get("article", ""),
-                    product=record.get("product", ""),
-                    qty=record.get("qty", "1")
-                )
-                writer.add_page(PdfReader(io.BytesIO(info_pdf)).pages[0])
-                
-                diagnostics.append({
-                    "page": page_index + 1, "status": "OK", "method": method,
-                    "order": order, "article": record.get("article", ""),
-                    "qty": record.get("qty", "1"), "label": record.get("label", "")
-                })
-            else:
-                not_found += 1
-                info_pdf = create_info_page(width, height, "НЕ НАЙДЕН", "", "Номер не распознан", "1")
-                writer.add_page(PdfReader(io.BytesIO(info_pdf)).pages[0])
-                
-                found_orders = extract_orders_from_text(text)
-                found_codes = re.findall(r"(?<!\d)(\d{4})(?!\d)", text)
-                diagnostics.append({
-                    "page": page_index + 1, "status": "NOT FOUND", "method": method,
-                    "order": found_orders[0] if found_orders else "",
-                    "label": found_codes[-1] if found_codes else ""
-                })
-
-    output = io.BytesIO()
-    writer.write(output)
-    output.seek(0)
-
-    return output.getvalue(), records, matched, not_found, methods, diagnostics
-
-# ============================================================
-# STREAMLIT ИНТЕРФЕЙС
-# ============================================================
-
-st.title("🖨️ Склейка: Этикетки + Лист подбора")
-st.caption("Маппинг на основе физических блоков. Игнорирует изменения шапки таблицы Ozon.")
-
-col1, col2 = st.columns(2)
-with col1:
-    labels_file = st.file_uploader("📦 Этикетки Ozon", type=["pdf"])
-with col2:
-    assembly_file = st.file_uploader("📋 Лист подбора Ozon", type=["pdf"])
-
-if st.button("🚀 Сформировать PDF", type="primary", use_container_width=True):
-    if not labels_file or not assembly_file:
-        st.error("Загрузите оба PDF файла.")
-        st.stop()
-
-    with st.spinner("Разбираю графические блоки листа подбора..."):
-        try:
-            output, records, matched, not_found, methods, diagnostics = process_files(
-                labels_file.getvalue(), assembly_file.getvalue()
-            )
-        except Exception as e:
-            st.exception(e)
-            st.stop()
-
-    st.success(f"Готово. Найдено: {matched}. Не найдено: {not_found}.")
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Записей листа подбора", len(records))
-    c2.metric("Успешно привязано", matched)
-    c3.metric("Ошибок", not_found)
-
-    st.subheader("🔎 Результаты")
-    for item in diagnostics[:50]:
-        if item["status"] == "OK":
-            st.write(f"✅ Стр. **{item['page']}** | Заказ: `{item['order']}` | Арт: `{item['article']}` | Кол-во: `{item['qty']}`")
-        else:
-            st.error(f"⚠️ Стр. **{item['page']}** — НЕ НАЙДЕНО | Заказ: `{item['order'] or '-'}` | 4 цифры: `{item['label'] or '-'}`")
-
-    st.download_button(
-        label="⬇️ Скачать готовый PDF",
-        data=output,
-        file_name="Ozon_Labels_Ready.pdf",
-        mime="application/pdf",
-        use_container_width=True
+    label_code = row.get(
+        "label_code",
+        ""
     )
+
+    if label_code:
+
+        # Отдельный словарь кодов
+        # будет создан вызывающей функцией
+
+        data["labels"][
+            label_code
+        ] = item
+
+    # --------------------------------------------------------
+    # По номеру отправления
+    # --------------------------------------------------------
+
+    for order in row.get(
+        "orders",
+        []
+    ):
+
+        normalized = normalize_order(
+            order
+        )
+
+        if not normalized:
+            continue
+
+        data["orders"][
+            normalized
+        ] = item
+
+        numeric = get_numeric_key(
+            normalized
+        )
+
+        if numeric:
+
+            data["numeric"][
+                numeric
+            ] = item
+
+            if len(numeric) >= 10:
+
+                data["numeric"][
+                    numeric[-10:]
+                ] = item
+
+
+# ============================================================
+# ПАРСИНГ ЛИСТА ПОДБОРА
+# ============================================================
+
+def parse_assembly_list(
+    pdf_file
+):
+
+    data = {
+        "orders": {},
+        "numeric": {},
+        "labels": {}
+    }
+
+    stats = {
+        "pages": 0,
+        "blocks": 0,
+        "rows": 0,
+        "orders": 0,
+        "articles": 0,
+        "products": 0,
+        "qty": 0,
+        "labels": 0
+    }
+
+    with pdfplumber.open(
+        pdf_file
+    ) as pdf:
+
+        stats["pages"] = len(
+            pdf.pages
+        )
+
+        progress = st.progress(
+            0
+        )
+
+        status_text = st.empty()
+
+        for page_index, page in enumerate(
+            pdf.pages
+        ):
+
+            status_text.text(
+                f"📄 Лист подбора: "
+                f"{page_index + 1}/"
+                f"{len(pdf.pages)}"
+            )
+
+            # ------------------------------------------------
+            # ГЛАВНОЕ:
+            # СТРОКИ ОПРЕДЕЛЯЮТСЯ ПО ГРАФИЧЕСКИМ ЛИНИЯМ
+            # ------------------------------------------------
+
+            row_boxes = get_row_boxes(
+                page
+            )
+
+            columns = detect_columns(
+                page
+            )
+
+            for bbox in row_boxes:
+
+                stats["blocks"] += 1
+
+                row = parse_row(
+                    page,
+                    bbox,
+                    columns
+                )
+
+                if not row:
+                    continue
+
+                # Не считаем заголовок строкой заказа
+
+                has_order = bool(
+                    row["orders"]
+                )
+
+                has_label = bool(
+                    row["label_code"]
+                )
+
+                if not has_order and not has_label:
+                    continue
+
+                stats["rows"] += 1
+
+                if row["orders"]:
+
+                    stats["orders"] += len(
+                        row["orders"]
+                    )
+
+                if (
+                    row["article"]
+                    and row["article"] != "-"
+                ):
+
+                    stats["articles"] += 1
+
+                if (
+                    row["name"]
+                    and row["name"] != "Товар"
+                ):
+
+                    stats["products"] += 1
+
+                if row["qty"]:
+
+                    stats["qty"] += 1
+
+                if row["label_code"]:
+
+                    stats["labels"] += 1
+
+                save_mapping(
+                    data,
+                    row
+                )
+
+            progress.progress(
+                (page_index + 1)
+                /
+                len(pdf.pages)
+            )
+
+    status_text.text(
+        "✅ Лист подбора обработан"
+    )
+
+    return data, stats
+
+
+# ============================================================
+# ПОИСК ТОВАРА ПО НОМЕРУ
+# ============================================================
+
+def find_info(
+    mapping,
+    order
+):
+
+    normalized = normalize_order(
+        order
+    )
+
+    # --------------------------------------------------------
+    # 1. Прямой номер
+    # --------------------------------------------------------
+
+    info = mapping["orders"].get(
+        normalized
+    )
+
+    if info:
+        return info, "номер"
+
+    # --------------------------------------------------------
+    # 2. Цифровой номер
+    # --------------------------------------------------------
+
+    numeric = get_numeric_key(
+        normalized
+    )
+
+    if numeric:
+
+        info = mapping["numeric"].get(
+            numeric
+        )
+
+        if info:
+            return info, "цифровой номер"
+
+        # ----------------------------------------------------
+        # 3. Последние 10 цифр
+        # ----------------------------------------------------
+
+        if len(numeric) >= 10:
+
+            info = mapping["numeric"].get(
+                numeric[-10:]
+            )
+
+            if info:
+                return info, "последние 10"
+
+    # --------------------------------------------------------
+    # 4. Последние 4 цифры
+    # --------------------------------------------------------
+
+    code = get_label_code(
+        normalized
+    )
+
+    if code:
+
+        info = mapping["labels"].get(
+            code
+        )
+
+        if info:
+            return info, "этикетка 4"
+
+    return None, None
+
+
+# ============================================================
+# СОЗДАНИЕ ИНФОРМАЦИОННОЙ СТРАНИЦЫ
+# ============================================================
+
+def create_info_label(
+    width,
+    height,
+    order_number,
+    product_info
+):
+
+    packet = BytesIO()
+
+    c = canvas.Canvas(
+        packet,
+        pagesize=(
+            width,
+            height
+        )
+    )
+
+    x_margin = 10
+
+    # --------------------------------------------------------
+    # Номер
+    # --------------------------------------------------------
+
+    c.setFont(
+        font_name,
+        10
+    )
+
+    c.drawString(
+        x_margin,
+        height - 18,
+        f"Заказ: {order_number}"
+    )
+
+    c.line(
+        x_margin,
+        height - 20,
+        width - x_margin,
+        height - 20
+    )
+
+    # --------------------------------------------------------
+    # Артикул
+    # --------------------------------------------------------
+
+    c.setFont(
+        font_name,
+        12
+    )
+
+    article = str(
+        product_info.get(
+            "article",
+            "-"
+        )
+    )
+
+    if len(article) > 25:
+
+        article = (
+            article[:22]
+            + "..."
+        )
+
+    c.drawString(
+        x_margin,
+        height - 35,
+        f"Арт: {article}"
+    )
+
+    # --------------------------------------------------------
+    # Название
+    # --------------------------------------------------------
+
+    name = str(
+        product_info.get(
+            "name",
+            "Товар не найден"
+        )
+    )
+
+    top_limit = (
+        height - 52
+    )
+
+    bottom_limit = 50
+
+    available_h = (
+        top_limit
+        -
+        bottom_limit
+    )
+
+    current_size = 10
+    line_h = 12
+
+    def get_lines(
+        txt,
+        chars
+    ):
+
+        words = txt.split()
+
+        result = []
+
+        current = ""
+
+        for word in words:
+
+            if (
+                len(current)
+                +
+                len(word)
+                <
+                chars
+            ):
+
+                current += (
+                    word
+                    +
+                    " "
+                )
+
+            else:
+
+                if current:
+
+                    result.append(
+                        current.strip()
+                    )
+
+                current = (
+                    word
+                    +
+                    " "
+                )
+
+        if current:
+
+            result.append(
+                current.strip()
+            )
+
+        return result
+
+    lines = get_lines(
+        name,
+        32
+    )
+
+    while (
+        len(lines) * line_h
+        >
+        available_h
+        and
+        current_size > 6
+    ):
+
+        current_size -= 0.5
+
+        line_h -= 0.6
+
+        lines = get_lines(
+            name,
+            int(
+                32 *
+                (
+                    10
+                    /
+                    current_size
+                )
+            )
+        )
+
+    c.setFont(
+        font_name,
+        current_size
+    )
+
+    y_text = top_limit
+
+    for line in lines:
+
+        if y_text > bottom_limit:
+
+            c.drawString(
+                x_margin,
+                y_text,
+                line
+            )
+
+            y_text -= line_h
+
+    # --------------------------------------------------------
+    # Количество
+    # --------------------------------------------------------
+
+    c.setFont(
+        font_name,
+        24
+    )
+
+    qty = product_info.get(
+        "qty",
+        "?"
+    )
+
+    c.drawString(
+        x_margin,
+        15,
+        f"КОЛ-ВО: {qty}"
+    )
+
+    c.save()
+
+    packet.seek(0)
+
+    return PdfReader(
+        packet
+    ).pages[0]
+
+
+# ============================================================
+# ИНТЕРФЕЙС
+# ============================================================
+
+col1, col2 = st.columns(
+    2
+)
+
+with col1:
+
+    labels_file = st.file_uploader(
+        "1️⃣ Этикетки (PDF)",
+        type="pdf"
+    )
+
+with col2:
+
+    assembly_file = st.file_uploader(
+        "2️⃣ Лист подбора отправлений (PDF)",
+        type="pdf"
+    )
+
+
+# ============================================================
+# ОБРАБОТКА
+# ============================================================
+
+if (
+    labels_file
+    and
+    assembly_file
+):
+
+    if st.button(
+        "🚀 Склеить файлы",
+        type="primary",
+        use_container_width=True
+    ):
+
+        total_labels = 0
+        success_count = 0
+
+        error_orders = []
+
+        with st.status(
+            "Анализ и склейка...",
+            expanded=True
+        ) as status:
+
+            # ------------------------------------------------
+            # ЛИСТ ПОДБОРА
+            # ------------------------------------------------
+
+            st.write(
+                "🔎 Читаю лист подбора "
+                "по горизонтальным линиям..."
+            )
+
+            assembly_data, stats = (
+                parse_assembly_list(
+                    assembly_file
+                )
+            )
+
+            st.write(
+                f"📄 Страниц: "
+                f"{stats['pages']}"
+            )
+
+            st.write(
+                f"📦 Строк заказов: "
+                f"{stats['rows']}"
+            )
+
+            st.write(
+                f"🔢 Номеров: "
+                f"{stats['orders']}"
+            )
+
+            st.write(
+                f"🏷️ Артикулов: "
+                f"{stats['articles']}"
+            )
+
+            st.write(
+                f"📦 Товаров: "
+                f"{stats['products']}"
+            )
+
+            st.write(
+                f"🔢 Количеств: "
+                f"{stats['qty']}"
+            )
+
+            st.write(
+                f"🏷️ Кодов этикеток: "
+                f"{stats['labels']}"
+            )
+
+            st.write(
+                f"🔑 Индексов номера: "
+                f"{len(assembly_data['orders'])}"
+            )
+
+            st.write(
+                f"🔑 Индексов этикетки: "
+                f"{len(assembly_data['labels'])}"
+            )
+
+            # ------------------------------------------------
+            # ЭТИКЕТКИ
+            # ------------------------------------------------
+
+            st.write(
+                "🏷️ Читаю этикетки..."
+            )
+
+            reader = PdfReader(
+                labels_file
+            )
+
+            writer = PdfWriter()
+
+            total_labels = len(
+                reader.pages
+            )
+
+            # ------------------------------------------------
+            # ОБРАБОТКА ЭТИКЕТОК
+            # ------------------------------------------------
+
+            for i in range(
+                total_labels
+            ):
+
+                page = reader.pages[i]
+
+                # Оригинальная этикетка
+
+                writer.add_page(
+                    page
+                )
+
+                try:
+
+                    text = (
+                        page.extract_text()
+                        or ""
+                    )
+
+                except Exception:
+
+                    text = ""
+
+                # ------------------------------------------------
+                # Ищем номер
+                # ------------------------------------------------
+
+                full_num = (
+                    extract_order_from_label(
+                        text
+                    )
+                )
+
+                w = float(
+                    page.mediabox.width
+                )
+
+                h = float(
+                    page.mediabox.height
+                )
+
+                if full_num:
+
+                    info, method = find_info(
+                        assembly_data,
+                        full_num
+                    )
+
+                    # ------------------------------------------------
+                    # Если номер не найден,
+                    # пробуем напрямую последние 4
+                    # ------------------------------------------------
+
+                    if not info:
+
+                        label_code = get_label_code(
+                            full_num
+                        )
+
+                        info = (
+                            assembly_data[
+                                "labels"
+                            ].get(
+                                label_code
+                            )
+                        )
+
+                        if info:
+
+                            method = (
+                                "резерв: "
+                                "4 цифры"
+                            )
+
+                    display_num = (
+                        full_num.upper()
+                    )
+
+                    if display_num.startswith(
+                        "II"
+                    ):
+
+                        display_num = (
+                            "ii"
+                            +
+                            display_num[2:]
+                        )
+
+                    if not info:
+
+                        info = {
+                            "name":
+                                "Товар не найден",
+
+                            "article":
+                                "-",
+
+                            "qty":
+                                "?"
+                        }
+
+                        error_orders.append(
+                            (
+                                i + 1,
+                                display_num
+                            )
+                        )
+
+                    else:
+
+                        success_count += 1
+
+                    writer.add_page(
+                        create_info_label(
+                            w,
+                            h,
+                            display_num,
+                            info
+                        )
+                    )
+
+                else:
+
+                    # ------------------------------------------------
+                    # Номер не распознан
+                    # ------------------------------------------------
+
+                    writer.add_page(
+                        create_info_label(
+                            w,
+                            h,
+                            "???",
+                            {
+                                "name":
+                                    "Номер не распознан",
+
+                                "article":
+                                    "-",
+
+                                "qty":
+                                    "-"
+                            }
+                        )
+                    )
+
+                    error_orders.append(
+                        (
+                            i + 1,
+                            "Номер не распознан"
+                        )
+                    )
+
+            status.update(
+                label="✅ Обработка завершена!",
+                state="complete"
+            )
+
+        # ====================================================
+        # ДИАГНОСТИКА
+        # ====================================================
+
+        st.divider()
+
+        st.subheader(
+            "📊 Диагностика"
+        )
+
+        col_m1, col_m2, col_m3 = (
+            st.columns(3)
+        )
+
+        col_m1.metric(
+            "Всего этикеток",
+            total_labels
+        )
+
+        col_m2.metric(
+            "Успешно",
+            success_count
+        )
+
+        col_m3.metric(
+            "Не найдено",
+            total_labels
+            -
+            success_count
+        )
+
+        # ----------------------------------------------------
+        # Диагностика листа
+        # ----------------------------------------------------
+
+        st.write(
+            "### 📋 Лист подбора"
+        )
+
+        d1, d2, d3, d4 = st.columns(
+            4
+        )
+
+        d1.metric(
+            "Строк",
+            stats["rows"]
+        )
+
+        d2.metric(
+            "Артикулов",
+            stats["articles"]
+        )
+
+        d3.metric(
+            "Количеств",
+            stats["qty"]
+        )
+
+        d4.metric(
+            "Этикеток",
+            stats["labels"]
+        )
+
+        # ----------------------------------------------------
+        # Ошибки
+        # ----------------------------------------------------
+
+        if (
+            success_count
+            ==
+            total_labels
+        ):
+
+            st.success(
+                "✅ Все этикетки успешно "
+                "сопоставлены!"
+            )
+
+        else:
+
+            st.error(
+                f"⚠️ Не найдено: "
+                f"{total_labels - success_count}"
+            )
+
+            if error_orders:
+
+                st.write(
+                    "### ❌ Проблемные этикетки"
+                )
+
+                for page_number, order in (
+                    error_orders[:100]
+                ):
+
+                    st.markdown(
+                        f"- Страница "
+                        f"**{page_number}** — "
+                        f"**{order}**"
+                    )
+
+                if len(
+                    error_orders
+                ) > 100:
+
+                    st.caption(
+                        f"... ещё "
+                        f"{len(error_orders) - 100}"
+                    )
+
+        # ====================================================
+        # СКАЧИВАНИЕ
+        # ====================================================
+
+        output = BytesIO()
+
+        writer.write(
+            output
+        )
+
+        output.seek(0)
+
+        st.download_button(
+            "📥 Скачать PDF для печати",
+            output,
+            "Ready_Labels.pdf",
+            "application/pdf",
+            type="primary",
+            use_container_width=True
+        )

@@ -2,7 +2,8 @@ import streamlit as st
 import os
 import re
 import io
-import csv
+import base64
+import time
 from collections import defaultdict, Counter
 
 import pandas as pd
@@ -19,388 +20,264 @@ from reportlab.lib.pagesizes import A4
 # НАСТРОЙКИ
 # ============================================================
 
-st.set_page_config(
-    page_title="Ozon FBS — этикетки + Лист подбора",
-    page_icon="📦",
-    layout="wide"
-)
+APP_TITLE = "Ozon FBS — обработка этикеток"
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Размер информационной страницы.
+# A4 оставляем для текущего режима.
+INFO_PAGE_SIZE = A4
 
-# Основной шрифт + резерв
+# Шрифты.
+# DejaVu здесь НЕ используется.
 FONT_CANDIDATES = [
-    ("RobotoFull", os.path.join(BASE_DIR, "Roboto_Full_Final.ttf")),
-    ("OzonFontFix", os.path.join(BASE_DIR, "OzonFont_Fix.ttf")),
+    "Roboto-Regular.ttf",
+    "Roboto_Full_Final.ttf",
+    "OzonFont_Fix.ttf",
 ]
 
-FONT_NAME = None
-FONT_PATH = None
+PRIMARY_FONT_NAME = "OzonRoboto"
+FALLBACK_FONT_NAME = "OzonRobotoFallback"
 
 
 # ============================================================
-# ЗАГРУЗКА ШРИФТА
-# ============================================================
-
-def load_font():
-    """
-    Приоритет:
-    1. Roboto_Full_Final.ttf
-    2. OzonFont_Fix.ttf
-
-    DejaVu намеренно НЕ используется.
-    """
-
-    global FONT_NAME, FONT_PATH
-
-    errors = []
-
-    for name, path in FONT_CANDIDATES:
-        if not os.path.exists(path):
-            errors.append(f"{os.path.basename(path)} — файл не найден")
-            continue
-
-        try:
-            pdfmetrics.registerFont(TTFont(name, path))
-            FONT_NAME = name
-            FONT_PATH = path
-            return True, f"{name}: {path}"
-
-        except Exception as e:
-            errors.append(
-                f"{os.path.basename(path)} — ошибка загрузки: {e}"
-            )
-
-    FONT_NAME = "Helvetica"
-    FONT_PATH = None
-
-    return False, "\n".join(errors)
-
-
-FONT_OK, FONT_MESSAGE = load_font()
-
-
-# ============================================================
-# НОРМАЛИЗАЦИЯ
+# БАЗОВЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
 
 def normalize_text(value):
     if value is None:
         return ""
 
-    s = str(value)
+    value = str(value)
+    value = value.replace("\xa0", " ")
+    value = value.replace("–", "-")
+    value = value.replace("—", "-")
+    value = value.replace("−", "-")
 
-    replacements = {
-        "\u00a0": " ",
-        "\u200b": "",
-        "\u200c": "",
-        "\u200d": "",
-        "\ufeff": "",
-        "–": "-",
-        "—": "-",
-        "−": "-",
-    }
-
-    for a, b in replacements.items():
-        s = s.replace(a, b)
-
-    return s.strip()
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def normalize_order(value):
     """
-    Приводит номер отправления к единому виду.
+    Нормализация номера отправления.
 
-    Пример:
+    Например:
+
     87180955-0554-25
     87180955 0554 25
-    87180955055425
+    87180955–0554–25
 
-    Сохраняем также нормализованный вариант только из цифр.
+    -> 87180955-0554-25
     """
 
-    s = normalize_text(value)
+    value = normalize_text(value)
 
-    if not s:
+    if not value:
         return ""
 
-    s = s.replace(" ", "")
+    value = value.replace(" ", "")
+    value = value.replace("–", "-")
+    value = value.replace("—", "-")
 
-    m = re.search(
-        r"(\d{6,15})[-\s]*(\d{2,8})[-\s]*(\d{1,8})",
-        s
-    )
+    parts = re.findall(r"\d+", value)
 
-    if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    if len(parts) >= 3:
+        return "-".join(parts[:3])
 
-    digits = re.sub(r"\D", "", s)
-
-    return digits
+    return value
 
 
-def order_digits(value):
-    return re.sub(r"\D", "", normalize_text(value))
+def normalize_article(value):
+    value = normalize_text(value)
+    return value
 
 
-def normalize_key(value):
-    """
-    Нормализация 4-значного ключа.
-    """
+def safe_int(value, default=0):
+    try:
+        if pd.isna(value):
+            return default
 
-    s = normalize_text(value)
+        value = str(value).strip()
+        if not value:
+            return default
 
-    digits = re.sub(r"\D", "", s)
+        value = value.replace(",", ".")
+        return int(float(value))
 
-    if len(digits) >= 4:
-        return digits[-4:]
-
-    return digits.zfill(4)
-
-
-# ============================================================
-# ПОИСК НОМЕРОВ ОТПРАВЛЕНИЙ
-# ============================================================
-
-ORDER_REGEX = re.compile(
-    r"\d{6,15}\s*[-–—]?\s*\d{2,8}\s*[-–—]?\s*\d{1,8}"
-)
+    except Exception:
+        return default
 
 
-def find_orders(text):
-    """
-    Возвращает номера отправлений, найденные в тексте.
-    """
-
-    text = normalize_text(text)
-
-    result = []
-
-    for m in ORDER_REGEX.finditer(text):
-        raw = m.group(0)
-
-        order = normalize_order(raw)
-
-        if order:
-            result.append(order)
-
-    # Убираем дубли, сохраняя порядок
-    seen = set()
-    out = []
-
-    for x in result:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-
-    return out
+def clean_filename(name):
+    name = re.sub(r"[^\w\-. ]+", "_", name or "")
+    return name[:150]
 
 
 # ============================================================
-# ПОИСК 4-ЗНАЧНЫХ КЛЮЧЕЙ
+# ШРИФТ
 # ============================================================
 
-def extract_four_digit_tokens(text):
+@st.cache_resource
+def load_fonts():
     """
-    Все самостоятельные 4-значные числа.
-    """
-
-    text = normalize_text(text)
-
-    found = re.findall(r"(?<!\d)(\d{4})(?!\d)", text)
-
-    result = []
-
-    for x in found:
-        if x not in result:
-            result.append(x)
-
-    return result
-
-
-def extract_long_numeric_tokens(text):
-    """
-    Находит длинные цифровые последовательности.
-    У новых этикеток последние 4 цифры часто являются
-    ключом для Листа подбора.
-    """
-
-    text = normalize_text(text)
-
-    found = re.findall(r"\d{7,30}", text)
-
-    result = []
-
-    for x in found:
-        if x not in result:
-            result.append(x)
-
-    return result
-
-
-def find_label_keys(text):
-    """
-    Определяет возможные 4-значные ключи новой этикетки.
+    Регистрируем Roboto.
+    DejaVu намеренно не используется.
 
     Приоритет:
-    1. последние 4 цифры длинного цифрового кода;
-    2. самостоятельные 4-значные числа;
-    3. варианты после OCR-искажений.
-
-    Примеры:
-        II5010320 2549 -> 2549
-        II50103202549  -> 2549
+    1. Roboto-Regular.ttf
+    2. Roboto_Full_Final.ttf
+    3. OzonFont_Fix.ttf
     """
 
-    text = normalize_text(text)
+    registered = []
 
-    keys = []
+    for filename in FONT_CANDIDATES:
+        path = os.path.join(os.getcwd(), filename)
 
-    # --------------------------------------------------------
-    # 1. Длинные цифровые последовательности
-    # --------------------------------------------------------
+        if not os.path.exists(path):
+            continue
 
-    long_numbers = extract_long_numeric_tokens(text)
+        try:
+            font_name = PRIMARY_FONT_NAME if not registered else FALLBACK_FONT_NAME
 
-    for num in long_numbers:
-        if len(num) >= 8:
-            key = num[-4:]
+            pdfmetrics.registerFont(
+                TTFont(font_name, path)
+            )
 
-            if key not in keys:
-                keys.append(key)
+            registered.append(
+                {
+                    "name": font_name,
+                    "path": path,
+                }
+            )
 
-    # --------------------------------------------------------
-    # 2. Самостоятельные 4 цифры
-    # --------------------------------------------------------
+        except Exception:
+            continue
 
-    for key in extract_four_digit_tokens(text):
-        if key not in keys:
-            keys.append(key)
+    if not registered:
+        return None
 
-    # --------------------------------------------------------
-    # 3. OCR-варианты
-    # --------------------------------------------------------
+    return registered[0]["name"]
 
-    variants = [
-        text,
-        text.replace("II", ""),
-        text.replace("Il", ""),
-        text.replace("ll", ""),
-        text.replace("1I", ""),
-        text.replace("I1", ""),
-    ]
 
-    for variant in variants:
-        for num in re.findall(r"\d{7,30}", variant):
-            key = num[-4:]
-
-            if key not in keys:
-                keys.append(key)
-
-    return keys
+FONT_NAME = load_fonts()
 
 
 # ============================================================
-# ЧТЕНИЕ API XLSX / CSV
+# ПОИСК КОЛОНОК В XLSX / CSV
+# ============================================================
+
+def find_column(df, variants):
+    """
+    Ищет колонку по нескольким вариантам.
+    Сначала точное совпадение, затем contains.
+    """
+
+    if df is None or df.empty:
+        return None
+
+    columns = list(df.columns)
+
+    normalized_columns = {}
+
+    for col in columns:
+        normalized_columns[col] = normalize_text(col).lower()
+
+    # Точное совпадение
+    for variant in variants:
+        v = normalize_text(variant).lower()
+
+        for original, normalized in normalized_columns.items():
+            if normalized == v:
+                return original
+
+    # Частичное совпадение
+    for variant in variants:
+        v = normalize_text(variant).lower()
+
+        for original, normalized in normalized_columns.items():
+            if v in normalized:
+                return original
+
+    return None
+
+
+# ============================================================
+# ЗАГРУЗКА API XLSX / CSV
 # ============================================================
 
 def read_api_file(uploaded_file):
     """
     Читает XLSX / XLS / CSV.
+
+    Возвращает DataFrame.
     """
 
-    name = uploaded_file.name.lower()
+    if uploaded_file is None:
+        return None
+
+    filename = uploaded_file.name.lower()
 
     try:
+        if filename.endswith(".xlsx"):
+            return pd.read_excel(uploaded_file)
 
-        if name.endswith(".xlsx") or name.endswith(".xls"):
-            df = pd.read_excel(uploaded_file)
+        if filename.endswith(".xls"):
+            return pd.read_excel(uploaded_file)
 
-        elif name.endswith(".csv"):
+        if filename.endswith(".csv"):
             raw = uploaded_file.getvalue()
 
-            try:
-                text = raw.decode("utf-8-sig")
-            except Exception:
-                text = raw.decode("cp1251", errors="replace")
+            for encoding in ["utf-8-sig", "utf-8", "cp1251"]:
+                try:
+                    text = raw.decode(encoding)
 
-            try:
-                df = pd.read_csv(io.StringIO(text))
-            except Exception:
-                df = pd.read_csv(
-                    io.StringIO(text),
-                    sep=";"
-                )
+                    return pd.read_csv(
+                        io.StringIO(text),
+                        sep=None,
+                        engine="python"
+                    )
 
-        else:
-            raise ValueError(
-                "Поддерживаются только XLSX, XLS и CSV"
-            )
+                except Exception:
+                    continue
 
-        # Нормализуем названия колонок
-        df.columns = [
-            normalize_text(str(c))
-            for c in df.columns
-        ]
-
-        return df
+        raise ValueError(
+            "Поддерживаются только XLSX, XLS и CSV."
+        )
 
     except Exception as e:
         raise RuntimeError(
-            f"Ошибка чтения API-файла: {e}"
+            f"Не удалось прочитать файл API: {e}"
         )
 
 
 # ============================================================
-# ПОИСК КОЛОНОК API
+# ИНДЕКС API ДАННЫХ
 # ============================================================
-
-def find_column(df, variants):
-    """
-    Ищет колонку по нескольким возможным названиям.
-    """
-
-    columns = list(df.columns)
-
-    normalized_columns = {
-        normalize_text(str(c)).lower(): c
-        for c in columns
-    }
-
-    # Сначала точное совпадение
-    for variant in variants:
-
-        v = normalize_text(variant).lower()
-
-        if v in normalized_columns:
-            return normalized_columns[v]
-
-    # Потом частичное
-    for col in columns:
-
-        col_norm = normalize_text(str(col)).lower()
-
-        for variant in variants:
-
-            v = normalize_text(variant).lower()
-
-            if v in col_norm:
-                return col
-
-    return None
-
 
 def build_api_index(df):
     """
-    Строит индекс:
+    Создаёт индекс:
 
-        номер отправления ->
-            {
-                order,
-                article,
-                name,
-                qty
-            }
+    Номер отправления
+        ->
+    {
+        order,
+        article,
+        name,
+        qty
+    }
+
+    Один номер отправления может встречаться
+    несколько раз, например при нескольких товарах.
+
+    Поэтому дополнительно строится индекс товаров.
     """
+
+    if df is None or df.empty:
+        return {
+            "orders": {},
+            "rows": [],
+            "columns": {},
+        }
 
     order_col = find_column(
         df,
@@ -452,17 +329,23 @@ def build_api_index(df):
         ]
     )
 
-    if not order_col:
-        raise ValueError(
-            "Не найдена колонка с номером отправления.\n\n"
-            f"Найдены колонки:\n{list(df.columns)}"
-        )
+    columns = {
+        "order": order_col,
+        "article": article_col,
+        "name": name_col,
+        "qty": qty_col,
+    }
 
-    index = {}
+    orders = defaultdict(list)
+    rows = []
 
     for _, row in df.iterrows():
 
-        raw_order = row.get(order_col, "")
+        raw_order = (
+            row.get(order_col, "")
+            if order_col is not None
+            else ""
+        )
 
         order = normalize_order(raw_order)
 
@@ -470,669 +353,926 @@ def build_api_index(df):
             continue
 
         article = (
-            row.get(article_col, "")
-            if article_col
-            else ""
+            normalize_article(row.get(article_col, ""))
+            if article_col is not None
+            else "-"
         )
 
         name = (
-            row.get(name_col, "")
-            if name_col
-            else ""
+            normalize_text(row.get(name_col, ""))
+            if name_col is not None
+            else "НЕ НАЙДЕНО"
         )
 
         qty = (
-            row.get(qty_col, "")
-            if qty_col
-            else ""
+            safe_int(row.get(qty_col, 1), 1)
+            if qty_col is not None
+            else 1
         )
 
-        article = normalize_text(article)
-        name = normalize_text(name)
-        qty = normalize_text(qty)
-
-        # Excel может отдавать 1.0
-        if re.fullmatch(r"\d+\.0", qty):
-            qty = qty[:-2]
-
-        index[order] = {
+        item = {
             "order": order,
-            "article": article if article else "-",
-            "name": name if name else "НЕ НАЙДЕНО",
-            "qty": qty if qty else "?",
+            "article": article or "-",
+            "name": name or "НЕ НАЙДЕНО",
+            "qty": qty,
         }
 
-    return index, {
-        "order_col": order_col,
-        "article_col": article_col,
-        "name_col": name_col,
-        "qty_col": qty_col,
+        orders[order].append(item)
+        rows.append(item)
+
+    return {
+        "orders": dict(orders),
+        "rows": rows,
+        "columns": columns,
     }
 
 
 # ============================================================
-# ИЗВЛЕЧЕНИЕ СЛОВ PDF С КООРДИНАТАМИ
+# ДАННЫЕ ОТПРАВЛЕНИЯ ИЗ API
 # ============================================================
 
-def extract_pdf_words(pdf_bytes):
+def get_order_data(api_index, order):
+    """
+    Возвращает агрегированные данные по отправлению.
+
+    Если в отправлении несколько товаров:
+      Арт: A / B
+      Название: товар 1 / товар 2
+      КОЛ-ВО: 2
+
+    """
+
+    order = normalize_order(order)
+
+    if not order:
+        return None
+
+    items = api_index.get("orders", {}).get(order)
+
+    if not items:
+        return None
+
+    articles = []
+    names = []
+    total_qty = 0
+
+    for item in items:
+
+        article = item.get("article", "-")
+        name = item.get("name", "НЕ НАЙДЕНО")
+        qty = safe_int(item.get("qty", 1), 1)
+
+        if article and article not in articles:
+            articles.append(article)
+
+        if name and name not in names:
+            names.append(name)
+
+        total_qty += qty
+
+    return {
+        "order": order,
+        "article": " / ".join(articles) if articles else "-",
+        "name": " / ".join(names) if names else "НЕ НАЙДЕНО",
+        "qty": total_qty if total_qty > 0 else 1,
+    }
+
+
+# ============================================================
+# ПОИСК НОМЕРОВ ОТПРАВЛЕНИЯ В PDF
+# ============================================================
+
+ORDER_PATTERN = re.compile(
+    r"\b\d{6,15}\s*[-–—]?\s*\d{2,8}\s*[-–—]?\s*\d{1,8}\b"
+)
+
+
+def find_order_candidates(text):
+    """
+    ВАЖНО:
+
+    Мы больше не считаем любой похожий номер
+    автоматически номером отправления.
+
+    Функция только возвращает кандидатов.
+
+    Проверка принадлежности отправления выполняется
+    через API index.
+    """
+
+    if not text:
+        return []
+
+    text = text.replace("\xa0", " ")
+
+    found = []
+
+    for match in ORDER_PATTERN.finditer(text):
+        candidate = normalize_order(match.group(0))
+
+        if candidate and candidate not in found:
+            found.append(candidate)
+
+    return found
+
+
+# ============================================================
+# НОВАЯ ЭТИКЕТКА — ВНУТРЕННИЙ КОД
+# ============================================================
+
+def find_internal_label_codes(text):
+    """
+    Вспомогательная диагностика для новых наклеек.
+
+    Например:
+
+        II5010320 2549
+        II50103202549
+
+    Мы МОЖЕМ увидеть этот код.
+
+    Но:
+
+        !!! НЕ используем последние 4 цифры
+        !!! как основной способ определения заказа.
+
+    Это принципиальное изменение архитектуры.
+    """
+
+    if not text:
+        return []
+
+    text = text.replace("\xa0", " ")
+
+    variants = []
+
+    patterns = [
+        r"\b(?:II|Il|I1|1I|ll)\s*\d{6,10}\s*\d{4}\b",
+        r"\b(?:II|Il|I1|1I|ll)\s*\d{6,10}\d{4}\b",
+        r"\bii\d{6,10}\s*\d{4}\b",
+        r"\bii\d{10,14}\b",
+    ]
+
+    for pattern in patterns:
+        for match in re.finditer(
+            pattern,
+            text,
+            flags=re.IGNORECASE
+        ):
+            value = normalize_text(match.group(0))
+
+            if value and value not in variants:
+                variants.append(value)
+
+    return variants
+
+
+# ============================================================
+# PDF: ИЗВЛЕЧЕНИЕ ТЕКСТА
+# ============================================================
+
+def extract_pdf_pages(pdf_bytes):
     """
     Возвращает:
 
     [
         {
-            page: 0,
-            words: [...]
+            "page": 1,
+            "text": "...",
         }
     ]
     """
 
-    result = []
+    pages = []
 
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+    with pdfplumber.open(
+        io.BytesIO(pdf_bytes)
+    ) as pdf:
 
-        for page_number, page in enumerate(pdf.pages):
+        for page_number, page in enumerate(
+            pdf.pages,
+            start=1
+        ):
 
             try:
-                words = page.extract_words(
-                    keep_blank_chars=False,
-                    use_text_flow=True
-                )
+                text = page.extract_text(
+                    x_tolerance=2,
+                    y_tolerance=3
+                ) or ""
+
             except Exception:
-                words = []
+                text = ""
 
-            result.append({
-                "page": page_number,
-                "words": words
-            })
+            pages.append(
+                {
+                    "page": page_number,
+                    "text": text,
+                }
+            )
 
-    return result
-
-
-def word_text(word):
-    return normalize_text(
-        word.get("text", "")
-    )
+    return pages
 
 
 # ============================================================
-# ГРУППИРОВКА WORDS В СТРОКИ
+# РЕЗЕРВНЫЙ АНАЛИЗ ЛИСТА ПОДБОРА
 # ============================================================
 
-def group_words_into_lines(words, tolerance=5):
+def build_picklist_index(picklist_bytes):
     """
-    Группирует слова по вертикальной координате.
-    """
+    Лист подбора теперь НЕ является основным источником.
 
-    if not words:
-        return []
+    Он нужен как резерв:
 
-    sorted_words = sorted(
-        words,
-        key=lambda w: (
-            float(w.get("top", 0)),
-            float(w.get("x0", 0))
-        )
-    )
+        внутренний код -> номер отправления
 
-    lines = []
+    если Ozon/PDF всё-таки позволяет получить такую связь
+    через текст листа.
 
-    for word in sorted_words:
-
-        top = float(word.get("top", 0))
-
-        target = None
-
-        for line in lines:
-
-            if abs(top - line["top"]) <= tolerance:
-                target = line
-                break
-
-        if target is None:
-
-            target = {
-                "top": top,
-                "words": []
-            }
-
-            lines.append(target)
-
-        target["words"].append(word)
-
-    for line in lines:
-        line["words"].sort(
-            key=lambda w: float(w.get("x0", 0))
-        )
-
-        line["text"] = " ".join(
-            word_text(w)
-            for w in line["words"]
-            if word_text(w)
-        )
-
-    return lines
-
-
-# ============================================================
-# КЛЮЧИ В СТРОКЕ
-# ============================================================
-
-def keys_from_line(line_text):
-    """
-    Ключи из одной строки.
     """
 
-    result = []
+    if not picklist_bytes:
+        return {
+            "key_to_orders": {},
+            "order_to_keys": {},
+        }
 
-    # длинные номера
-    for num in extract_long_numeric_tokens(line_text):
+    key_to_orders = defaultdict(set)
+    order_to_keys = defaultdict(set)
 
-        key = num[-4:]
+    try:
+        with pdfplumber.open(
+            io.BytesIO(picklist_bytes)
+        ) as pdf:
 
-        if key not in result:
-            result.append(key)
+            for page in pdf.pages:
 
-    # самостоятельные 4 цифры
-    for key in extract_four_digit_tokens(line_text):
+                words = page.extract_words(
+                    x_tolerance=2,
+                    y_tolerance=3,
+                    keep_blank_chars=False
+                )
 
-        if key not in result:
-            result.append(key)
+                if not words:
+                    continue
 
-    return result
+                # ------------------------------------------------
+                # Группируем слова в строки
+                # ------------------------------------------------
 
+                lines = []
 
-# ============================================================
-# ПОИСК МАППИНГА НА ЛИСТЕ ПОДБОРА
-# ============================================================
-
-def build_picklist_mapping(pdf_bytes):
-    """
-    Строит:
-
-        4-значный ключ -> номер отправления
-
-    На листе подбора обычно рядом находятся:
-
-        2549
-        87180955-0554-25
-
-    либо:
-
-        II50103202549
-        87180955-0554-25
-    """
-
-    mapping_candidates = defaultdict(set)
-
-    diagnostics = []
-
-    pages_data = extract_pdf_words(pdf_bytes)
-
-    for page_data in pages_data:
-
-        page_number = page_data["page"]
-        words = page_data["words"]
-
-        lines = group_words_into_lines(words)
-
-        page_text = "\n".join(
-            line["text"]
-            for line in lines
-        )
-
-        orders_on_page = find_orders(page_text)
-
-        # ----------------------------------------------------
-        # Основной способ:
-        # номер заказа + ключ в одной / соседней строке
-        # ----------------------------------------------------
-
-        for i, line in enumerate(lines):
-
-            orders = find_orders(line["text"])
-
-            if not orders:
-                continue
-
-            nearby_lines = []
-
-            for j in range(
-                max(0, i - 2),
-                min(len(lines), i + 3)
-            ):
-                nearby_lines.append(lines[j])
-
-            keys = []
-
-            for nearby in nearby_lines:
-
-                for key in keys_from_line(
-                    nearby["text"]
+                for word in sorted(
+                    words,
+                    key=lambda x: (
+                        round(float(x.get("top", 0)), 1),
+                        float(x.get("x0", 0))
+                    )
                 ):
 
-                    if key not in keys:
-                        keys.append(key)
+                    top = float(word.get("top", 0))
 
-            for order in orders:
+                    target = None
 
-                for key in keys:
+                    for line in lines:
+                        if abs(line["top"] - top) <= 4:
+                            target = line
+                            break
 
-                    mapping_candidates[key].add(
-                        order
-                    )
-
-        # ----------------------------------------------------
-        # Способ 2:
-        # пространственный поиск
-        # ----------------------------------------------------
-
-        order_words = []
-
-        for word in words:
-
-            text = word_text(word)
-
-            if not text:
-                continue
-
-            found_orders = find_orders(text)
-
-            if found_orders:
-
-                for order in found_orders:
-
-                    order_words.append(
-                        {
-                            "order": order,
-                            "word": word
+                    if target is None:
+                        target = {
+                            "top": top,
+                            "words": []
                         }
+
+                        lines.append(target)
+
+                    target["words"].append(word)
+
+                # ------------------------------------------------
+                # Ищем номер отправления + 4 цифры
+                # ------------------------------------------------
+
+                for line in lines:
+
+                    line_words = sorted(
+                        line["words"],
+                        key=lambda x: float(x.get("x0", 0))
                     )
 
-        four_digit_words = []
-
-        for word in words:
-
-            text = word_text(word)
-
-            if re.fullmatch(
-                r"\d{4}",
-                text
-            ):
-
-                four_digit_words.append(
-                    {
-                        "key": text,
-                        "word": word
-                    }
-                )
-
-        for ow in order_words:
-
-            ow_word = ow["word"]
-
-            ox = float(ow_word.get("x0", 0))
-            oy = float(ow_word.get("top", 0))
-
-            candidates = []
-
-            for kw in four_digit_words:
-
-                kw_word = kw["word"]
-
-                kx = float(kw_word.get("x0", 0))
-                ky = float(kw_word.get("top", 0))
-
-                dy = abs(ky - oy)
-                dx = abs(kx - ox)
-
-                # Обычно номер и ключ находятся рядом
-                if dy <= 80 and dx <= 350:
-
-                    distance = dy * 2 + dx
-
-                    candidates.append(
-                        (
-                            distance,
-                            kw["key"]
+                    line_text = " ".join(
+                        normalize_text(
+                            x.get("text", "")
                         )
+                        for x in line_words
                     )
 
-            candidates.sort(
-                key=lambda x: x[0]
-            )
-
-            # Берём ближайшие до 3 кандидатов
-            for _, key in candidates[:3]:
-
-                mapping_candidates[key].add(
-                    ow["order"]
-                )
-
-        # ----------------------------------------------------
-        # Способ 3:
-        # если на странице ровно один заказ,
-        # пытаемся связать его с ключами страницы
-        # ----------------------------------------------------
-
-        if len(orders_on_page) == 1:
-
-            only_order = orders_on_page[0]
-
-            page_keys = []
-
-            for key in find_label_keys(page_text):
-
-                if key not in page_keys:
-                    page_keys.append(key)
-
-            # Если ключей немного — это хороший кандидат
-            if 1 <= len(page_keys) <= 5:
-
-                for key in page_keys:
-
-                    mapping_candidates[key].add(
-                        only_order
+                    orders = find_order_candidates(
+                        line_text
                     )
 
-        diagnostics.append({
-            "page": page_number + 1,
-            "orders": orders_on_page,
-            "keys": find_label_keys(page_text),
-            "text": page_text
-        })
+                    if not orders:
+                        continue
 
-    # --------------------------------------------------------
-    # Формируем окончательный индекс.
-    #
-    # Если один ключ связан с несколькими заказами —
-    # он считается неоднозначным.
-    # --------------------------------------------------------
+                    keys = set()
 
-    mapping = {}
+                    for word in line_words:
 
-    ambiguous = {}
+                        token = normalize_text(
+                            word.get("text", "")
+                        )
 
-    for key, orders in mapping_candidates.items():
+                        if re.fullmatch(
+                            r"\d{4}",
+                            token
+                        ):
+                            keys.add(token)
 
-        if len(orders) == 1:
+                    for order in orders:
+                        for key in keys:
+                            key_to_orders[key].add(order)
+                            order_to_keys[order].add(key)
 
-            mapping[key] = next(iter(orders))
-
-        elif len(orders) > 1:
-
-            ambiguous[key] = sorted(
-                orders
-            )
-
-    return mapping, ambiguous, diagnostics
-
-
-# ============================================================
-# ПОИСК ДАННЫХ ЭТИКЕТКИ
-# ============================================================
-
-def get_page_text(page):
-    try:
-        return normalize_text(
-            page.extract_text() or ""
-        )
     except Exception:
-        return ""
+        return {
+            "key_to_orders": {},
+            "order_to_keys": {},
+        }
 
-
-def find_direct_order(page_text):
-    orders = find_orders(page_text)
-
-    if not orders:
-        return None
-
-    # Если несколько — берём первый
-    return orders[0]
-
-
-def choose_key_from_page(page_text):
-    """
-    Определяем ключ для новой этикетки.
-
-    Стараемся не брать случайные 4 цифры,
-    если есть длинный цифровой код.
-    """
-
-    long_numbers = extract_long_numeric_tokens(
-        page_text
-    )
-
-    candidates = []
-
-    for num in long_numbers:
-
-        if len(num) >= 8:
-
-            key = num[-4:]
-
-            if key not in candidates:
-                candidates.append(key)
-
-    if candidates:
-        return candidates[0]
-
-    four_digits = extract_four_digit_tokens(
-        page_text
-    )
-
-    # Убираем типичные числа, которые чаще бывают
-    # датами/временем/весом и т.п.
-    excluded = {
-        "2026",
-        "2025",
-        "2024",
-        "2023",
-        "0000",
+    return {
+        "key_to_orders": dict(key_to_orders),
+        "order_to_keys": dict(order_to_keys),
     }
 
-    filtered = [
-        x
-        for x in four_digits
-        if x not in excluded
-    ]
 
-    if filtered:
-        return filtered[-1]
+# ============================================================
+# РЕЗЕРВНОЕ СОПОСТАВЛЕНИЕ НОВОГО КОДА
+# ============================================================
 
-    return None
+def try_picklist_fallback(
+    internal_codes,
+    picklist_index,
+    api_index
+):
+    """
+    Очень осторожный fallback.
+
+    Мы НЕ берём последние 4 цифры напрямую.
+
+    Только если внутренний код содержит 4-значную часть,
+    и лист подбора однозначно связывает её с заказом,
+    который существует в API.
+
+    """
+
+    if not internal_codes:
+        return None, None
+
+    key_to_orders = picklist_index.get(
+        "key_to_orders",
+        {}
+    )
+
+    if not key_to_orders:
+        return None, None
+
+    for code in internal_codes:
+
+        # Получаем только потенциальные 4 цифры
+        # для резервной проверки.
+        keys = re.findall(
+            r"(?<!\d)\d{4}(?!\d)",
+            code
+        )
+
+        for key in keys:
+
+            candidates = set(
+                key_to_orders.get(key, set())
+            )
+
+            # Оставляем только те,
+            # которые реально есть в API.
+            valid = []
+
+            for order in candidates:
+                if order in api_index.get("orders", {}):
+                    valid.append(order)
+
+            if len(valid) == 1:
+                return (
+                    normalize_order(valid[0]),
+                    key
+                )
+
+    return None, None
+
+
+# ============================================================
+# АРХИТЕКТУРА ПРОВАЙДЕРА ЭТИКЕТОК
+# ============================================================
+
+class LabelProvider:
+    """
+    Базовый интерфейс.
+
+    Сейчас используем ExistingPdfLabelProvider.
+
+    Позже сюда можно подключить Ozon API:
+
+        OzonApiLabelProvider
+
+    Тогда остальная программа вообще не должна знать,
+    откуда пришёл PDF.
+    """
+
+    def get_pdf(self):
+        raise NotImplementedError
+
+
+class ExistingPdfLabelProvider(LabelProvider):
+    """
+    Текущий режим:
+
+    пользователь загружает уже готовый PDF.
+    """
+
+    def __init__(self, pdf_bytes):
+        self.pdf_bytes = pdf_bytes
+
+    def get_pdf(self):
+        return self.pdf_bytes
+
+
+class OzonApiLabelProvider(LabelProvider):
+    """
+    Заготовка для нового API.
+
+    Сейчас НЕ вызывается автоматически.
+
+    В актуальном API найден метод:
+
+        POST /v2/posting/fbs/package-label
+
+    Он принимает posting_number.
+
+    Но этот класс специально отделён от текущего режима,
+    чтобы изменение API не ломало обработку уже
+    полученного PDF.
+
+    """
+
+    BASE_URL = "https://api-seller.ozon.ru"
+
+    def __init__(
+        self,
+        client_id,
+        api_key,
+        posting_numbers
+    ):
+        self.client_id = client_id
+        self.api_key = api_key
+        self.posting_numbers = posting_numbers
+
+    def get_pdf(self):
+        """
+        Пока намеренно не выполняем HTTP-запрос здесь.
+
+        Подключение requests можно добавить отдельным этапом,
+        когда в приложении будут заданы Client-Id / Api-Key
+        и окончательно подтверждён рабочий production flow
+        новых scanit-этикеток.
+        """
+
+        raise NotImplementedError(
+            "Получение PDF через Ozon API будет подключено "
+            "отдельным провайдером."
+        )
+
+
+# ============================================================
+# СОПОСТАВЛЕНИЕ СТРАНИЦ PDF
+# ============================================================
+
+def resolve_page(
+    page_number,
+    text,
+    api_index,
+    picklist_index,
+    known_postings=None
+):
+    """
+    Главная функция распознавания.
+
+    Приоритет:
+
+    1. Явный номер отправления в PDF,
+       который существует в API.
+
+    2. Если PDF не содержит номера,
+       но приложение получило известный список posting_number,
+       используем номер по позиции страницы.
+
+    3. Резервно проверяем внутренний код через лист подбора.
+
+    4. Если ничего не получилось:
+       НЕРАСПОЗНАНО.
+
+    """
+
+    text = text or ""
+
+    api_orders = api_index.get(
+        "orders",
+        {}
+    )
+
+    # --------------------------------------------------------
+    # 1. Ищем обычные номера
+    # --------------------------------------------------------
+
+    candidates = find_order_candidates(text)
+
+    valid_api_candidates = []
+
+    for candidate in candidates:
+
+        normalized = normalize_order(candidate)
+
+        if normalized in api_orders:
+            valid_api_candidates.append(normalized)
+
+    # Если нашли ровно один реальный номер
+    if len(valid_api_candidates) == 1:
+
+        order = valid_api_candidates[0]
+
+        return {
+            "page": page_number,
+            "type": "Прямой номер",
+            "key": "",
+            "order": order,
+            "api_found": True,
+            "data": get_order_data(
+                api_index,
+                order
+            ),
+            "raw_text": text,
+        }
+
+    # Если несколько, выбираем только однозначный
+    if len(valid_api_candidates) > 1:
+
+        counts = Counter(
+            valid_api_candidates
+        )
+
+        most_common = counts.most_common()
+
+        if (
+            len(most_common) == 1
+            or (
+                len(most_common) > 1
+                and most_common[0][1] > most_common[1][1]
+            )
+        ):
+
+            order = most_common[0][0]
+
+            return {
+                "page": page_number,
+                "type": "Прямой номер",
+                "key": "",
+                "order": order,
+                "api_found": True,
+                "data": get_order_data(
+                    api_index,
+                    order
+                ),
+                "raw_text": text,
+            }
+
+    # --------------------------------------------------------
+    # 2. НОВАЯ ЭТИКЕТКА БЕЗ НОМЕРА
+    #
+    # Если у нас есть список отправлений,
+    # который в будущем придёт прямо из API,
+    # можем использовать позиционное соответствие.
+    # --------------------------------------------------------
+
+    if known_postings:
+
+        if page_number <= len(known_postings):
+
+            order = normalize_order(
+                known_postings[page_number - 1]
+            )
+
+            if order in api_orders:
+
+                return {
+                    "page": page_number,
+                    "type": "API-позиция",
+                    "key": "",
+                    "order": order,
+                    "api_found": True,
+                    "data": get_order_data(
+                        api_index,
+                        order
+                    ),
+                    "raw_text": text,
+                }
+
+    # --------------------------------------------------------
+    # 3. Внутренний код новой наклейки
+    # --------------------------------------------------------
+
+    internal_codes = find_internal_label_codes(
+        text
+    )
+
+    # --------------------------------------------------------
+    # 4. Осторожный fallback через лист подбора
+    # --------------------------------------------------------
+
+    order, key = try_picklist_fallback(
+        internal_codes,
+        picklist_index,
+        api_index
+    )
+
+    if order:
+
+        return {
+            "page": page_number,
+            "type": "Резерв: лист подбора",
+            "key": key or "",
+            "order": order,
+            "api_found": True,
+            "data": get_order_data(
+                api_index,
+                order
+            ),
+            "raw_text": text,
+        }
+
+    # --------------------------------------------------------
+    # 5. Нераспознанная
+    # --------------------------------------------------------
+
+    return {
+        "page": page_number,
+        "type": (
+            "Новая этикетка без номера"
+            if internal_codes
+            else "Не распознано"
+        ),
+        "key": (
+            ", ".join(internal_codes)
+            if internal_codes
+            else ""
+        ),
+        "order": "",
+        "api_found": False,
+        "data": None,
+        "raw_text": text,
+    }
 
 
 # ============================================================
 # СОЗДАНИЕ ИНФОРМАЦИОННОЙ СТРАНИЦЫ
 # ============================================================
 
-def create_info_page(
-    order,
-    article,
-    name,
-    qty,
-    page_size
+def draw_wrapped_text(
+    c,
+    text,
+    x,
+    y,
+    max_width,
+    font_name,
+    font_size,
+    leading
 ):
     """
-    Создаёт одну страницу с информацией.
+    Рисует текст с переносом по ширине.
+    """
 
-    ВАЖНО:
-    SKU здесь НЕ выводится.
+    text = normalize_text(text)
+
+    if not text:
+        return y
+
+    words = text.split()
+
+    lines = []
+    current = ""
+
+    for word in words:
+
+        test = (
+            word
+            if not current
+            else current + " " + word
+        )
+
+        try:
+            width = pdfmetrics.stringWidth(
+                test,
+                font_name,
+                font_size
+            )
+        except Exception:
+            width = len(test) * font_size * 0.5
+
+        if width <= max_width:
+            current = test
+        else:
+
+            if current:
+                lines.append(current)
+
+            current = word
+
+    if current:
+        lines.append(current)
+
+    for line in lines:
+
+        c.drawString(
+            x,
+            y,
+            line
+        )
+
+        y -= leading
+
+    return y
+
+
+def create_info_page(info):
+    """
+    Создаёт вторую страницу.
+
+    Формат:
+
+        ИНФОРМАЦИЯ ПО ОТПРАВЛЕНИЮ
+
+        Заказ: ...
+        Арт: ...
+        Название: ...
+        КОЛ-ВО: ...
+
     """
 
     buffer = io.BytesIO()
 
     c = canvas.Canvas(
         buffer,
-        pagesize=page_size
+        pagesize=INFO_PAGE_SIZE
     )
 
-    width, height = page_size
+    width, height = INFO_PAGE_SIZE
 
-    # --------------------------------------------------------
-    # Шрифт
-    # --------------------------------------------------------
+    font = FONT_NAME
 
-    if FONT_NAME:
-        font_name = FONT_NAME
-    else:
-        font_name = "Helvetica"
-
-    # --------------------------------------------------------
-    # Размеры
-    # --------------------------------------------------------
+    # Если шрифт не загрузился,
+    # используем стандартный Helvetica.
+    # Для кириллицы он может не отображаться,
+    # поэтому в нормальной установке нужен Roboto.
+    if not font:
+        font = "Helvetica"
 
     left = 45
-
-    y = height - 80
+    right = 45
+    max_width = width - left - right
 
     # --------------------------------------------------------
     # Заголовок
     # --------------------------------------------------------
 
     c.setFont(
-        font_name,
-        24
+        font,
+        22
+    )
+
+    c.drawString(
+        left,
+        height - 70,
+        "ИНФОРМАЦИЯ ПО ОТПРАВЛЕНИЮ"
+    )
+
+    # --------------------------------------------------------
+    # Разделительная линия
+    # --------------------------------------------------------
+
+    c.setLineWidth(1)
+
+    c.line(
+        left,
+        height - 90,
+        width - right,
+        height - 90
+    )
+
+    # --------------------------------------------------------
+    # Данные
+    # --------------------------------------------------------
+
+    order = info.get(
+        "order",
+        ""
+    ) or "НЕ РАСПОЗНАН"
+
+    data = info.get(
+        "data"
+    )
+
+    if data:
+
+        article = data.get(
+            "article",
+            "-"
+        )
+
+        name = data.get(
+            "name",
+            "НЕ НАЙДЕНО"
+        )
+
+        qty = data.get(
+            "qty",
+            1
+        )
+
+    else:
+
+        article = "-"
+        name = "НЕ НАЙДЕНО"
+        qty = "?"
+
+    y = height - 145
+
+    # Заказ
+    c.setFont(
+        font,
+        17
     )
 
     c.drawString(
         left,
         y,
-        "ИНФОРМАЦИЯ ПО ОТПРАВЛЕНИЮ"
+        f"Заказ: {order}"
     )
 
-    y -= 60
+    y -= 45
+
+    # Артикул
+    c.setFont(
+        font,
+        16
+    )
+
+    c.drawString(
+        left,
+        y,
+        f"Арт: {article}"
+    )
+
+    y -= 45
+
+    # Название
+    c.setFont(
+        font,
+        16
+    )
+
+    c.drawString(
+        left,
+        y,
+        "Название:"
+    )
+
+    y -= 28
+
+    y = draw_wrapped_text(
+        c=c,
+        text=name,
+        x=left,
+        y=y,
+        max_width=max_width,
+        font_name=font,
+        font_size=16,
+        leading=24
+    )
 
     # --------------------------------------------------------
-    # Поля
+    # Количество
     # --------------------------------------------------------
 
-    fields = [
-        ("Заказ:", order),
-        ("Арт:", article),
-        ("Название:", name),
-        ("КОЛ-ВО:", qty),
-    ]
-
-    label_size = 17
-    value_size = 17
-
-    for label, value in fields:
-
-        c.setFont(
-            font_name,
-            label_size
-        )
-
-        c.drawString(
-            left,
-            y,
-            label
-        )
-
-        c.setFont(
-            font_name,
-            value_size
-        )
-
-        # Значение справа от label
-        label_width = pdfmetrics.stringWidth(
-            label,
-            font_name,
-            label_size
-        )
-
-        value_x = left + label_width + 15
-
-        # Для длинного названия переносим строку
-        if label == "Название:":
-
-            max_width = width - value_x - 45
-
-            value = str(value)
-
-            # Если короткое
-            if pdfmetrics.stringWidth(
-                value,
-                font_name,
-                value_size
-            ) <= max_width:
-
-                c.drawString(
-                    value_x,
-                    y,
-                    value
-                )
-
-                y -= 45
-
-            else:
-
-                words = value.split()
-
-                line = ""
-
-                first_line = True
-
-                for word in words:
-
-                    test = (
-                        line + " " + word
-                    ).strip()
-
-                    if pdfmetrics.stringWidth(
-                        test,
-                        font_name,
-                        value_size
-                    ) <= max_width:
-
-                        line = test
-
-                    else:
-
-                        if line:
-
-                            c.drawString(
-                                value_x if first_line else left,
-                                y,
-                                line
-                            )
-
-                            y -= 28
-
-                            first_line = False
-
-                        line = word
-
-                if line:
-
-                    c.drawString(
-                        value_x if first_line else left,
-                        y,
-                        line
-                    )
-
-                    y -= 45
-
-        else:
-
-            c.drawString(
-                value_x,
-                y,
-                str(value)
-            )
-
-            y -= 50
-
-    # --------------------------------------------------------
-    # Большое количество
-    # --------------------------------------------------------
-
-    y -= 20
+    y -= 65
 
     c.setFont(
-        font_name,
-        38
+        font,
+        30
     )
 
     c.drawString(
@@ -1140,6 +1280,43 @@ def create_info_page(
         y,
         f"КОЛ-ВО: {qty}"
     )
+
+    # --------------------------------------------------------
+    # Диагностический тип
+    # --------------------------------------------------------
+
+    y -= 45
+
+    c.setFont(
+        font,
+        10
+    )
+
+    c.drawString(
+        left,
+        y,
+        f"Источник сопоставления: {info.get('type', '')}"
+    )
+
+    # --------------------------------------------------------
+    # Внутренний ключ — только мелко,
+    # если он действительно был найден.
+    # --------------------------------------------------------
+
+    key = info.get(
+        "key",
+        ""
+    )
+
+    if key:
+
+        y -= 18
+
+        c.drawString(
+            left,
+            y,
+            f"Внутренний код: {key}"
+        )
 
     c.showPage()
     c.save()
@@ -1150,195 +1327,46 @@ def create_info_page(
 
 
 # ============================================================
-# ОСНОВНАЯ ОБРАБОТКА ЭТИКЕТОК
+# ДОБАВЛЕНИЕ ИНФОРМАЦИОННЫХ СТРАНИЦ
 # ============================================================
 
-def process_labels(
-    labels_bytes,
-    api_index,
-    picklist_mapping
+def build_result_pdf(
+    original_pdf_bytes,
+    results
 ):
     """
-    На каждую исходную страницу:
+    Для каждой исходной страницы:
 
-        1. оригинальная этикетка
-        2. информационная страница
+        оригинальная страница
+        +
+        информационная страница
 
-    Итого всегда 2 страницы на отправление.
     """
 
-    reader = PdfReader(
-        io.BytesIO(labels_bytes)
+    source_reader = PdfReader(
+        io.BytesIO(original_pdf_bytes)
     )
 
     writer = PdfWriter()
 
-    stats = {
-        "total": len(reader.pages),
-        "direct": 0,
-        "new": 0,
-        "found_api": 0,
-        "not_found_api": 0,
-        "not_recognized": 0,
-    }
-
-    diagnostics = []
-
-    for page_index, source_page in enumerate(
-        reader.pages
+    for index, page in enumerate(
+        source_reader.pages
     ):
 
-        # ----------------------------------------------------
-        # Добавляем оригинальную страницу БЕЗ изменений
-        # ----------------------------------------------------
+        writer.add_page(page)
 
-        writer.add_page(source_page)
-
-        # ----------------------------------------------------
-        # Получаем текст
-        # ----------------------------------------------------
-
-        try:
-            page_text = source_page.extract_text() or ""
-        except Exception:
-            page_text = ""
-
-        page_text = normalize_text(
-            page_text
-        )
-
-        # ----------------------------------------------------
-        # 1. Прямой номер отправления
-        # ----------------------------------------------------
-
-        order = find_direct_order(
-            page_text
-        )
-
-        key = None
-        recognition_type = None
-
-        if order:
-
-            recognition_type = "Прямой номер"
-
-            stats["direct"] += 1
-
-        else:
-
-            # ------------------------------------------------
-            # 2. Новая этикетка
-            # ------------------------------------------------
-
-            key = choose_key_from_page(
-                page_text
+        if index < len(results):
+            info_pdf = create_info_page(
+                results[index]
             )
 
-            if key:
-
-                recognition_type = (
-                    "Новая этикетка / 4 цифры"
-                )
-
-                stats["new"] += 1
-
-                order = picklist_mapping.get(
-                    key
-                )
-
-        # ----------------------------------------------------
-        # Получаем данные API
-        # ----------------------------------------------------
-
-        api_data = None
-
-        if order:
-
-            api_data = api_index.get(
-                normalize_order(order)
+            info_reader = PdfReader(
+                io.BytesIO(info_pdf)
             )
 
-        if api_data:
-
-            stats["found_api"] += 1
-
-            info_order = api_data["order"]
-            article = api_data["article"]
-            name = api_data["name"]
-            qty = api_data["qty"]
-
-        else:
-
-            stats["not_found_api"] += 1
-
-            if order:
-
-                info_order = order
-                article = "-"
-                name = "НЕ НАЙДЕНО"
-                qty = "?"
-
-            else:
-
-                stats["not_recognized"] += 1
-
-                info_order = "НЕ РАСПОЗНАН"
-                article = "-"
-                name = "НЕ НАЙДЕНО"
-                qty = "?"
-
-        # ----------------------------------------------------
-        # Информационная страница
-        # ----------------------------------------------------
-
-        page_width = float(
-            source_page.mediabox.width
-        )
-
-        page_height = float(
-            source_page.mediabox.height
-        )
-
-        page_size = (
-            page_width,
-            page_height
-        )
-
-        info_pdf = create_info_page(
-            info_order,
-            article,
-            name,
-            qty,
-            page_size
-        )
-
-        info_reader = PdfReader(
-            io.BytesIO(info_pdf)
-        )
-
-        writer.add_page(
-            info_reader.pages[0]
-        )
-
-        # ----------------------------------------------------
-        # Диагностика
-        # ----------------------------------------------------
-
-        diagnostics.append({
-            "page": page_index + 1,
-            "type": recognition_type or "НЕ РАСПОЗНАН",
-            "key": key or "",
-            "order": order or "",
-            "api_found": bool(api_data),
-            "article": article,
-            "name": name,
-            "qty": qty,
-            "text": page_text,
-        })
-
-    # --------------------------------------------------------
-    # Запись
-    # --------------------------------------------------------
+            writer.add_page(
+                info_reader.pages[0]
+            )
 
     output = io.BytesIO()
 
@@ -1346,426 +1374,758 @@ def process_labels(
 
     output.seek(0)
 
-    return output.getvalue(), stats, diagnostics
+    return output.getvalue()
 
 
 # ============================================================
-# UI
+# ДИАГНОСТИКА
 # ============================================================
 
-st.title(
-    "📦 Ozon FBS — этикетки + Лист подбора"
+def diagnostics_dataframe(results):
+    rows = []
+
+    for result in results:
+
+        data = result.get("data") or {}
+
+        rows.append(
+            {
+                "Страница": result.get(
+                    "page",
+                    ""
+                ),
+
+                "Тип": result.get(
+                    "type",
+                    ""
+                ),
+
+                "Ключ": result.get(
+                    "key",
+                    ""
+                ),
+
+                "Заказ": result.get(
+                    "order",
+                    ""
+                ),
+
+                "API найден": (
+                    "Да"
+                    if result.get(
+                        "api_found"
+                    )
+                    else "Нет"
+                ),
+
+                "Артикул": data.get(
+                    "article",
+                    "-"
+                ),
+
+                "Количество": data.get(
+                    "qty",
+                    "?"
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# ПОПЫТКА ПОЛУЧИТЬ СПИСОК ОТПРАВЛЕНИЙ ИЗ API XLSX
+# ============================================================
+
+def get_known_postings_from_api(api_index):
+    """
+    Возвращает уникальный список posting_number
+    в порядке первого появления в XLSX.
+
+    ВАЖНО:
+
+    Это не идеальный порядок для будущего API PDF.
+
+    Поэтому использовать его для позиционного
+    сопоставления безопасно только если PDF был
+    сформирован именно из этого же списка и в том же порядке.
+
+    """
+
+    result = []
+
+    for item in api_index.get(
+        "rows",
+        []
+    ):
+
+        order = normalize_order(
+            item.get("order", "")
+        )
+
+        if order and order not in result:
+            result.append(order)
+
+    return result
+
+
+# ============================================================
+# STREAMLIT
+# ============================================================
+
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="📦",
+    layout="wide"
 )
+
+st.title("📦 Ozon FBS — обработка этикеток")
 
 st.caption(
-    "На каждую этикетку создаётся ровно 2 страницы: "
-    "оригинальная этикетка + информационная страница."
+    "Текущий режим: готовый PDF → API XLSX → "
+    "информационная страница. "
+    "Архитектура подготовлена под новый источник этикеток Ozon API."
 )
 
 
 # ============================================================
-# ИНФОРМАЦИЯ О ШРИФТЕ
+# СТАТУС ШРИФТА
 # ============================================================
 
-st.subheader("🔤 Шрифт")
+with st.expander(
+    "🔤 Диагностика шрифта",
+    expanded=False
+):
 
-if FONT_OK:
+    if FONT_NAME:
 
-    st.success(
-        f"Используется основной шрифт: "
-        f"`{os.path.basename(FONT_PATH)}`"
+        st.success(
+            f"Используется шрифт: {FONT_NAME}"
+        )
+
+    else:
+
+        st.error(
+            "Roboto не найден. "
+            "Положите Roboto-Regular.ttf, "
+            "Roboto_Full_Final.ttf или OzonFont_Fix.ttf "
+            "рядом с app.py."
+        )
+
+    st.write(
+        "Ожидаемые файлы:"
     )
 
-    st.caption(
-        "Приоритет: Roboto_Full_Final.ttf → "
-        "OzonFont_Fix.ttf"
-    )
+    for filename in FONT_CANDIDATES:
 
-else:
+        exists = os.path.exists(
+            os.path.join(
+                os.getcwd(),
+                filename
+            )
+        )
 
-    st.error(
-        "Не удалось загрузить Roboto_Full_Final.ttf "
-        "или OzonFont_Fix.ttf."
-    )
-
-    st.code(
-        FONT_MESSAGE
-    )
-
-    st.warning(
-        "Проверьте, что эти файлы находятся рядом с app.py."
-    )
+        st.write(
+            f"{'✅' if exists else '❌'} {filename}"
+        )
 
 
 # ============================================================
-# ФАЙЛЫ
+# ЗАГРУЗКА ФАЙЛОВ
 # ============================================================
 
 st.subheader("1. Файлы")
 
-labels_file = st.file_uploader(
-    "📄 Оригинальные Ozon этикетки PDF",
-    type=["pdf"],
-    key="labels_pdf"
-)
+col1, col2 = st.columns(2)
 
-api_file = st.file_uploader(
-    "📊 Выгрузка Ozon API XLSX / CSV",
-    type=["xlsx", "xls", "csv"],
-    key="api_file"
-)
+with col1:
+
+    labels_file = st.file_uploader(
+        "📄 PDF этикеток Ozon",
+        type=["pdf"],
+        key="labels_pdf"
+    )
+
+with col2:
+
+    api_file = st.file_uploader(
+        "📊 XLSX / CSV с данными отправлений",
+        type=["xlsx", "xls", "csv"],
+        key="api_file"
+    )
 
 picklist_file = st.file_uploader(
-    "📋 Лист подбора PDF",
+    "📋 Лист подбора — необязательно",
     type=["pdf"],
     key="picklist_pdf"
 )
 
 
 # ============================================================
-# ЗАПУСК
+# БУДУЩИЙ РЕЖИМ API
+# ============================================================
+
+with st.expander(
+    "🔌 Новый режим Ozon API — подготовлено",
+    expanded=False
+):
+
+    st.info(
+        "Сейчас приложение работает с уже скачанным PDF. "
+        "Ниже оставлена архитектура для подключения "
+        "получения этикеток через новый Seller API."
+    )
+
+    st.code(
+        """Ozon API
+    ↓
+список posting_number
+    ↓
+формирование PDF этикеток
+    ↓
+полученный PDF
+    ↓
+этот же обработчик
+    ↓
+Артикул / Название / КОЛ-ВО""",
+        language="text"
+    )
+
+    st.caption(
+        "Полученный PDF должен поступать в тот же "
+        "LabelProvider, поэтому распознавание и "
+        "создание информационных страниц не зависит "
+        "от способа получения PDF."
+    )
+
+
+# ============================================================
+# ПРОВЕРКА
+# ============================================================
+
+if labels_file is None:
+
+    st.warning(
+        "Загрузите PDF этикеток."
+    )
+
+    st.stop()
+
+
+if api_file is None:
+
+    st.warning(
+        "Загрузите XLSX/CSV с данными отправлений."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# ЧТЕНИЕ API
+# ============================================================
+
+try:
+
+    with st.spinner(
+        "Читаю данные отправлений..."
+    ):
+
+        api_df = read_api_file(
+            api_file
+        )
+
+        api_index = build_api_index(
+            api_df
+        )
+
+except Exception as e:
+
+    st.error(
+        str(e)
+    )
+
+    st.stop()
+
+
+# ============================================================
+# ИНФОРМАЦИЯ ОБ API
+# ============================================================
+
+st.subheader("2. Данные отправлений")
+
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    st.metric(
+        "Строк API",
+        len(
+            api_index.get(
+                "rows",
+                []
+            )
+        )
+    )
+
+with col2:
+    st.metric(
+        "Отправлений",
+        len(
+            api_index.get(
+                "orders",
+                {}
+            )
+        )
+    )
+
+with col3:
+    st.write(
+        "**Номер:**"
+    )
+
+    st.write(
+        api_index.get(
+            "columns",
+            {}
+        ).get(
+            "order"
+        )
+        or "не найден"
+    )
+
+with col4:
+    st.write(
+        "**Количество:**"
+    )
+
+    st.write(
+        api_index.get(
+            "columns",
+            {}
+        ).get(
+            "qty"
+        )
+        or "не найдено"
+    )
+
+
+if not api_index.get("orders"):
+
+    st.error(
+        "В XLSX/CSV не найдено ни одного номера отправления."
+    )
+
+    st.write(
+        "Найденные колонки:"
+    )
+
+    st.write(
+        api_index.get(
+            "columns",
+            {}
+        )
+    )
+
+    st.stop()
+
+
+# ============================================================
+# ЛИСТ ПОДБОРА
+# ============================================================
+
+picklist_index = {
+    "key_to_orders": {},
+    "order_to_keys": {},
+}
+
+if picklist_file is not None:
+
+    with st.spinner(
+        "Анализирую лист подбора..."
+    ):
+
+        picklist_bytes = (
+            picklist_file.getvalue()
+        )
+
+        picklist_index = build_picklist_index(
+            picklist_bytes
+        )
+
+    key_count = len(
+        picklist_index.get(
+            "key_to_orders",
+            {}
+        )
+    )
+
+    st.caption(
+        f"Лист подбора: найдено внутренних ключей — {key_count}"
+    )
+
+
+# ============================================================
+# ПОЛУЧАЕМ PDF ЧЕРЕЗ ПРОВАЙДЕР
+# ============================================================
+
+original_pdf_bytes = labels_file.getvalue()
+
+provider = ExistingPdfLabelProvider(
+    original_pdf_bytes
+)
+
+pdf_bytes = provider.get_pdf()
+
+
+# ============================================================
+# ИЗВЛЕЧЕНИЕ СТРАНИЦ
+# ============================================================
+
+with st.spinner(
+    "Анализирую страницы PDF..."
+):
+
+    pdf_pages = extract_pdf_pages(
+        pdf_bytes
+    )
+
+
+st.subheader("3. Распознавание")
+
+st.write(
+    f"Страниц в исходном PDF: **{len(pdf_pages)}**"
+)
+
+
+# ============================================================
+# ИЗВЕСТНЫЕ ОТПРАВЛЕНИЯ
+# ============================================================
+
+known_postings = []
+
+use_position_mapping = False
+
+st.markdown(
+    "### Сопоставление новых этикеток"
+)
+
+position_mode = st.checkbox(
+    "Использовать позиционное сопоставление для этикеток без номера",
+    value=False,
+    help=(
+        "Включайте только если этот PDF сформирован "
+        "из точно этого же списка отправлений "
+        "и порядок отправлений совпадает."
+    )
+)
+
+if position_mode:
+
+    known_postings = get_known_postings_from_api(
+        api_index
+    )
+
+    use_position_mapping = True
+
+    st.warning(
+        f"Позиционный режим включён. "
+        f"Доступно отправлений: {len(known_postings)}. "
+        f"Это безопасно только при совпадении порядка."
+    )
+
+
+# ============================================================
+# ОБРАБОТКА
 # ============================================================
 
 if st.button(
-    "🚀 ОБРАБОТАТЬ",
+    "🚀 Обработать PDF",
     type="primary",
     use_container_width=True
 ):
 
-    if not labels_file:
-        st.error(
-            "Загрузите оригинальные этикетки PDF."
-        )
-        st.stop()
+    results = []
 
-    if not api_file:
-        st.error(
-            "Загрузите XLSX/CSV выгрузку Ozon API."
-        )
-        st.stop()
-
-    if not picklist_file:
-        st.error(
-            "Загрузите PDF Лист подбора."
-        )
-        st.stop()
-
-    # --------------------------------------------------------
-    # Читаем файлы
-    # --------------------------------------------------------
-
-    labels_bytes = labels_file.getvalue()
-    api_bytes = api_file.getvalue()
-    picklist_bytes = picklist_file.getvalue()
-
-    # --------------------------------------------------------
-    # API
-    # --------------------------------------------------------
-
-    with st.spinner(
-        "Читаю выгрузку Ozon API..."
-    ):
-
-        try:
-
-            class UploadedMemoryFile:
-                def __init__(self, name, data):
-                    self.name = name
-                    self._data = data
-
-                def getvalue(self):
-                    return self._data
-
-            api_memory = UploadedMemoryFile(
-                api_file.name,
-                api_bytes
-            )
-
-            df = read_api_file(
-                api_memory
-            )
-
-            api_index, api_columns = build_api_index(
-                df
-            )
-
-        except Exception as e:
-
-            st.error(
-                f"Ошибка API-файла: {e}"
-            )
-
-            st.stop()
-
-    # --------------------------------------------------------
-    # Лист подбора
-    # --------------------------------------------------------
-
-    with st.spinner(
-        "Анализирую Лист подбора..."
-    ):
-
-        try:
-
-            picklist_mapping, ambiguous, picklist_diag = (
-                build_picklist_mapping(
-                    picklist_bytes
-                )
-            )
-
-        except Exception as e:
-
-            st.error(
-                f"Ошибка анализа Листа подбора: {e}"
-            )
-
-            st.stop()
-
-    # --------------------------------------------------------
-    # Этикетки
-    # --------------------------------------------------------
-
-    with st.spinner(
-        "Обрабатываю этикетки..."
-    ):
-
-        try:
-
-            output_bytes, stats, diagnostics = (
-                process_labels(
-                    labels_bytes,
-                    api_index,
-                    picklist_mapping
-                )
-            )
-
-        except Exception as e:
-
-            st.error(
-                f"Ошибка обработки PDF: {e}"
-            )
-
-            st.exception(e)
-
-            st.stop()
-
-    # ========================================================
-    # РЕЗУЛЬТАТ
-    # ========================================================
-
-    st.success(
-        "Готово!"
+    progress = st.progress(
+        0
     )
 
-    # --------------------------------------------------------
-    # Статистика
-    # --------------------------------------------------------
+    status = st.empty()
 
-    st.subheader(
-        "📊 Результат"
+    for i, page_info in enumerate(
+        pdf_pages
+    ):
+
+        page_number = page_info["page"]
+        text = page_info["text"]
+
+        status.write(
+            f"Страница {page_number} / {len(pdf_pages)}"
+        )
+
+        result = resolve_page(
+            page_number=page_number,
+            text=text,
+            api_index=api_index,
+            picklist_index=picklist_index,
+            known_postings=(
+                known_postings
+                if use_position_mapping
+                else None
+            )
+        )
+
+        results.append(
+            result
+        )
+
+        progress.progress(
+            int(
+                ((i + 1) / len(pdf_pages)) * 100
+            )
+        )
+
+    status.empty()
+
+    st.session_state["results"] = results
+    st.session_state["original_pdf_bytes"] = pdf_bytes
+
+
+# ============================================================
+# РЕЗУЛЬТАТЫ
+# ============================================================
+
+if "results" in st.session_state:
+
+    results = st.session_state[
+        "results"
+    ]
+
+    original_pdf_bytes = st.session_state[
+        "original_pdf_bytes"
+    ]
+
+    st.subheader("4. Результат распознавания")
+
+    total = len(results)
+
+    found = sum(
+        1
+        for x in results
+        if x.get("api_found")
     )
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    unresolved = total - found
+
+    col1, col2, col3 = st.columns(3)
 
     with col1:
         st.metric(
-            "Этикеток",
-            stats["total"]
+            "Всего страниц",
+            total
         )
 
     with col2:
         st.metric(
-            "Прямой номер",
-            stats["direct"]
+            "Распознано",
+            found
         )
 
     with col3:
         st.metric(
-            "Новые",
-            stats["new"]
+            "Не распознано",
+            unresolved
         )
 
-    with col4:
-        st.metric(
-            "Найдено API",
-            stats["found_api"]
-        )
+    # --------------------------------------------------------
+    # Таблица
+    # --------------------------------------------------------
 
-    with col5:
-        st.metric(
-            "Не найдено",
-            stats["not_found_api"]
-        )
-
-    st.info(
-        f"В результате будет "
-        f"{stats['total'] * 2} страниц."
+    df_diag = diagnostics_dataframe(
+        results
     )
 
-    # --------------------------------------------------------
-    # Информация API
-    # --------------------------------------------------------
-
-    with st.expander(
-        "🔎 Колонки, найденные в API"
-    ):
-
-        st.write(
-            api_columns
-        )
-
-        st.write(
-            f"Записей API: {len(df)}"
-        )
-
-    # --------------------------------------------------------
-    # Маппинг Листа подбора
-    # --------------------------------------------------------
-
-    with st.expander(
-        f"📋 Маппинг Листа подбора "
-        f"({len(picklist_mapping)} ключей)"
-    ):
-
-        if picklist_mapping:
-
-            mapping_rows = []
-
-            for key, order in sorted(
-                picklist_mapping.items()
-            ):
-
-                mapping_rows.append({
-                    "Ключ": key,
-                    "Номер отправления": order
-                })
-
-            st.dataframe(
-                pd.DataFrame(mapping_rows),
-                use_container_width=True,
-                hide_index=True
-            )
-
-        else:
-
-            st.warning(
-                "Не найдено ни одного соответствия "
-                "4 цифры → номер отправления."
-            )
-
-        if ambiguous:
-
-            st.warning(
-                f"Неоднозначных ключей: "
-                f"{len(ambiguous)}"
-            )
-
-            ambiguous_rows = []
-
-            for key, orders in ambiguous.items():
-
-                ambiguous_rows.append({
-                    "Ключ": key,
-                    "Варианты заказов": ", ".join(
-                        orders
-                    )
-                })
-
-            st.dataframe(
-                pd.DataFrame(ambiguous_rows),
-                use_container_width=True,
-                hide_index=True
-            )
+    st.dataframe(
+        df_diag,
+        use_container_width=True,
+        hide_index=True
+    )
 
     # --------------------------------------------------------
     # Нераспознанные
     # --------------------------------------------------------
 
-    unresolved = [
+    unresolved_results = [
         x
-        for x in diagnostics
-        if not x["order"]
-        or not x["api_found"]
+        for x in results
+        if not x.get("api_found")
     ]
 
-    with st.expander(
-        f"⚠️ Диагностика проблемных этикеток "
-        f"({len(unresolved)})"
-    ):
+    if unresolved_results:
 
-        if not unresolved:
+        st.warning(
+            f"Нераспознано страниц: "
+            f"{len(unresolved_results)}"
+        )
 
-            st.success(
-                "Все этикетки распознаны и найдены в API."
-            )
+        with st.expander(
+            "🔎 Подробная диагностика нераспознанных страниц",
+            expanded=False
+        ):
 
-        else:
-
-            for item in unresolved:
+            for item in unresolved_results:
 
                 st.markdown(
-                    f"### Страница {item['page']}"
+                    f"### Страница {item.get('page')}"
                 )
 
-                st.write({
-                    "Тип": item["type"],
-                    "Ключ": item["key"],
-                    "Заказ": item["order"],
-                    "API найден": item["api_found"],
-                    "Артикул": item["article"],
-                    "Количество": item["qty"],
-                })
+                st.write(
+                    f"**Тип:** {item.get('type')}"
+                )
+
+                st.write(
+                    f"**Ключ:** {item.get('key') or '-'}"
+                )
+
+                st.write(
+                    f"**Заказ:** "
+                    f"{item.get('order') or '-'}"
+                )
+
+                raw_text = item.get(
+                    "raw_text",
+                    ""
+                )
 
                 st.text_area(
                     "Извлечённый текст",
-                    item["text"],
-                    height=180,
-                    key=f"diag_{item['page']}"
+                    raw_text[:5000],
+                    height=160,
+                    key=f"raw_{item.get('page')}"
                 )
 
                 st.divider()
 
     # --------------------------------------------------------
-    # Все этикетки
-    # --------------------------------------------------------
-
-    with st.expander(
-        "🔍 Полная диагностика всех этикеток"
-    ):
-
-        diagnostic_rows = []
-
-        for item in diagnostics:
-
-            diagnostic_rows.append({
-                "Страница": item["page"],
-                "Тип": item["type"],
-                "Ключ": item["key"],
-                "Заказ": item["order"],
-                "API": "ДА" if item["api_found"] else "НЕТ",
-                "Артикул": item["article"],
-                "Количество": item["qty"],
-            })
-
-        st.dataframe(
-            pd.DataFrame(diagnostic_rows),
-            use_container_width=True,
-            hide_index=True
-        )
-
-    # --------------------------------------------------------
-    # Скачать
+    # Создание итогового PDF
     # --------------------------------------------------------
 
     st.subheader(
-        "⬇️ Скачать результат"
+        "5. Формирование итогового PDF"
     )
 
-    st.download_button(
-        label="📥 Скачать готовый PDF",
-        data=output_bytes,
-        file_name="Ozon_FBS_Этикетки_2_страницы.pdf",
-        mime="application/pdf",
-        type="primary",
-        use_container_width=True
+    try:
+
+        with st.spinner(
+            "Создаю итоговый PDF..."
+        ):
+
+            output_pdf = build_result_pdf(
+                original_pdf_bytes,
+                results
+            )
+
+        filename = (
+            "Ozon_FBS_готовый_"
+            f"{len(results)}_отправлений.pdf"
+        )
+
+        st.download_button(
+            label="📥 Скачать итоговый PDF",
+            data=output_pdf,
+            file_name=filename,
+            mime="application/pdf",
+            type="primary",
+            use_container_width=True
+        )
+
+        st.success(
+            "Готово. На каждую исходную страницу "
+            "добавлена отдельная информационная страница."
+        )
+
+    except Exception as e:
+
+        st.error(
+            f"Ошибка формирования PDF: {e}"
+        )
+
+
+# ============================================================
+# ПРЕДПРОСМОТР API
+# ============================================================
+
+with st.expander(
+    "📊 Первые строки API",
+    expanded=False
+):
+
+    st.dataframe(
+        api_df.head(50),
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+# ============================================================
+# ТЕХНИЧЕСКАЯ ИНФОРМАЦИЯ
+# ============================================================
+
+with st.expander(
+    "⚙️ Техническая информация",
+    expanded=False
+):
+
+    st.write(
+        "### Текущая архитектура"
+    )
+
+    st.code(
+        """ExistingPdfLabelProvider
+        ↓
+     PDF
+        ↓
+extract_pdf_pages()
+        ↓
+resolve_page()
+        ↓
+ ┌──────────────────────────────┐
+ │ 1. Номер отправления в PDF   │
+ │ 2. API-позиция (опционально) │
+ │ 3. Лист подбора — fallback   │
+ │ 4. НЕ РАСПОЗНАНО             │
+ └──────────────────────────────┘
+        ↓
+build_result_pdf()
+        ↓
+Оригинал + Информация""",
+        language="text"
+    )
+
+    st.write(
+        "### Что специально НЕ используется"
+    )
+
+    st.write(
+        "❌ автоматическое принятие последних 4 цифр "
+        "как номера заказа"
+    )
+
+    st.write(
+        "❌ автоматическое преобразование "
+        "`II50103202549` в заказ"
+    )
+
+    st.write(
+        "❌ угадывание отправления по похожему номеру"
+    )
+
+    st.write(
+        "### Подготовлено для нового API"
+    )
+
+    st.write(
+        "Отдельный `LabelProvider` позволяет заменить "
+        "источник PDF без переписывания обработки "
+        "и создания информационных страниц."
     )
